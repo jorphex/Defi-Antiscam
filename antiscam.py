@@ -397,7 +397,8 @@ async def on_message(message: discord.Message):
                 view = ScreeningView(flagged_member_id=author.id)
                 embed = result.get("embed")
                 embed.set_footer(text=f"User ID: {author.id}")
-                await alert_channel.send(embed=embed, view=view)
+                allowed_mentions = discord.AllowedMentions(users=[author])
+                await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
             except Exception as e:
                 logger.error(f"Failed to send message alert for {author.name}: {e}")
 
@@ -512,9 +513,26 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
         origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(guild.id))
         if origin_mod_channel_id:
             origin_mod_channel = guild.get_channel(origin_mod_channel_id)
+            if not origin_mod_channel:
+                try:
+                    origin_mod_channel = await bot.fetch_channel(origin_mod_channel_id)
+                except (discord.NotFound, discord.Forbidden):
+                    logger.warning(f"Could not find or access origin mod channel {origin_mod_channel_id}")
+                    origin_mod_channel = None
+
             if origin_mod_channel:
-                origin_alert_embed = discord.Embed(title="🛡️ Federated Ban", description=f"The manual ban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
-                await origin_mod_channel.send(embed=origin_alert_embed)
+                embed_desc = (
+                    f"The manual ban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.\n\n"
+                    f"**Reason:**\n```{ban_reason[:1000]}```"
+                )
+                origin_alert_embed = discord.Embed(
+                    title="✅ Manual Ban Propagated", 
+                    description=embed_desc, 
+                    color=discord.Color.blue(), 
+                    timestamp=datetime.now(timezone.utc)
+                )
+                allowed_mentions = discord.AllowedMentions(users=[user])
+                await origin_mod_channel.send(embed=origin_alert_embed, allowed_mentions=allowed_mentions)
 
     for guild_id in config.get("federated_guild_ids", []):
         if guild_id == guild.id: continue
@@ -544,6 +562,13 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                 mod_channel_id = config.get("mod_alert_channels", {}).get(str(target_guild.id))
                 if mod_channel_id:
                     mod_channel = target_guild.get_channel(mod_channel_id)
+                    if not mod_channel:
+                        try:
+                            mod_channel = await bot.fetch_channel(mod_channel_id)
+                        except (discord.NotFound, discord.Forbidden):
+                            logger.warning(f"Could not find or access mod channel {mod_channel_id} in {target_guild.name}")
+                            mod_channel = None
+
                     if mod_channel:
                         alert_embed = discord.Embed(
                             title="🛡️ Federated Ban Received",
@@ -561,7 +586,9 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                         alert_embed.set_author(name=user.name, icon_url=user.display_avatar.url)
                         
                         view = FederatedAlertView(banned_user_id=user.id)
-                        await mod_channel.send(embed=alert_embed, view=view)
+                        
+                        allowed_mentions = discord.AllowedMentions(users=[user])
+                        await mod_channel.send(embed=alert_embed, view=view, allowed_mentions=allowed_mentions)
 
             except Exception as e:
                 logger.error(f"Error during federated ban propagation to {target_guild.name}: {e}", exc_info=True)
@@ -646,8 +673,24 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
         origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(guild.id))
         if origin_mod_channel_id:
             origin_mod_channel = guild.get_channel(origin_mod_channel_id)
+            if not origin_mod_channel:
+                try:
+                    origin_mod_channel = await bot.fetch_channel(origin_mod_channel_id)
+                except (discord.NotFound, discord.Forbidden):
+                    logger.warning(f"Could not find or access origin mod channel {origin_mod_channel_id}")
+                    origin_mod_channel = None
+
             if origin_mod_channel:
-                origin_alert_embed = discord.Embed(title="ℹ️ Federated Unban", description=f"The unban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.", color=discord.Color.light_grey(), timestamp=datetime.now(timezone.utc))
+                embed_desc = (
+                    f"The unban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.\n\n"
+                    f"**Reason:**\n```{unban_reason[:1000]}```"
+                )
+                origin_alert_embed = discord.Embed(
+                    title="✅ Global Unban Propagated", 
+                    description=embed_desc, 
+                    color=discord.Color.light_grey(), 
+                    timestamp=datetime.now(timezone.utc)
+                )
                 await origin_mod_channel.send(embed=origin_alert_embed)
 
         for guild_id in config.get("federated_guild_ids", []):
@@ -670,9 +713,31 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
                     mod_channel_id = config.get("mod_alert_channels", {}).get(str(target_guild.id))
                     if mod_channel_id:
                         mod_channel = target_guild.get_channel(mod_channel_id)
+                        if not mod_channel:
+                            try:
+                                mod_channel = await bot.fetch_channel(mod_channel_id)
+                            except (discord.NotFound, discord.Forbidden):
+                                logger.warning(f"Could not find or access mod channel {mod_channel_id} in {target_guild.name}")
+                                mod_channel = None
+
                         if mod_channel:
-                            alert_embed = discord.Embed(title="ℹ️ Federated Unban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Action:** Automatically unbanned from this server.\n**Origin:** **{guild.name}**", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-                            await mod_channel.send(embed=alert_embed)
+                            alert_embed = discord.Embed(
+                                title="ℹ️ Federated Unban Received", 
+                                description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n"
+                                            f"**Action:** Automatically unbanned from this server.\n"
+                                            f"**Origin:** **{guild.name}**", 
+                                color=discord.Color.green(), 
+                                timestamp=datetime.now(timezone.utc)
+                            )
+                            alert_embed.add_field(
+                                name="Reason from Origin Server",
+                                value=f"```{unban_reason[:1000]}```",
+                                inline=False
+                            )
+                            alert_embed.set_author(name=user.name, icon_url=user.display_avatar.url)
+                            
+                            allowed_mentions = discord.AllowedMentions(users=[user])
+                            await mod_channel.send(embed=alert_embed, allowed_mentions=allowed_mentions)
                 except Exception as e:
                     logger.error(f"Error during federated unban propagation to {target_guild.name}: {e}", exc_info=True)
                     if log_channel: await log_channel.send(f"❌ Failed to unban `{user}` in `{target_guild.name}` - Error: `{e}`")
