@@ -333,7 +333,12 @@ async def on_member_join(member: discord.Member):
         logger.info(f"Member {member.name} has a whitelisted role. Skipping screen.")
         return
 
-    result = await screen_member(member, config)
+    keywords_data = await load_keywords()
+    if not keywords_data:
+        logger.error("Could not load keywords for on_member_join screen. Aborting check.")
+        return
+
+    result = await screen_member(member, config, keywords_data)
 
     if result.get("flagged"):
         logger.info(f"FLAGGED member on join: {member.name} in {member.guild.name}.")
@@ -677,7 +682,7 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
     
     await save_fed_stats(stats)
 
-async def screen_member(member: discord.Member, config: dict) -> dict:
+async def screen_member(member: discord.Member, config: dict, keywords_data: dict) -> dict:
     """
     Performs the complete screening process for a single member and returns the findings.
     Does NOT perform any actions (timeout, send message).
@@ -710,9 +715,6 @@ async def screen_member(member: discord.Member, config: dict) -> dict:
         embed.add_field(name="Status", value="User timed out for 1 day. Awaiting review...", inline=True)
         
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
-
-    keywords_data = await load_keywords()
-    if not keywords_data: return {"flagged": False}
 
     try:
         user_profile = await bot.fetch_user(member.id)
@@ -796,10 +798,18 @@ async def run_full_scan(interaction: discord.Interaction):
         return
     if not guild.chunked:
         await guild.chunk()
+
+    keywords_data = await load_keywords()
+    if not keywords_data:
+        await interaction.followup.send("❌ **Scan Aborted:** Could not load keywords file. Please check logs.", ephemeral=True)
+        if guild.id in active_scans: del active_scans[guild.id]
+        return
+    
     total_members = guild.member_count
     progress_message = None
     checked_count, flagged_count = 0, 0
     update_interval = 100
+    
     try:
         progress_message = await interaction.channel.send(f"🔍 Scan initiated. Preparing to scan {total_members} members in **{guild.name}**...")
         logger.info(f"Full member scan initiated by {interaction.user.name} for guild '{guild.name}'.")
