@@ -237,12 +237,12 @@ class FederatedAlertView(discord.ui.View):
         super().__init__(timeout=None)
         self.banned_user_id = banned_user_id
 
-    @discord.ui.button(label="Unban", style=discord.ButtonStyle.secondary, custom_id="fed_alert_unban")
+    @discord.ui.button(label="Unban Locally", style=discord.ButtonStyle.secondary, custom_id="fed_alert_unban")
     async def unban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         user_to_unban = discord.Object(id=self.banned_user_id)
         try:
-            reason_text = "[Federated Action] Ban reversed by local Moderator."
+            reason_text = "[Local Action] Federated ban reversed by local Moderator."
             await interaction.guild.unban(user_to_unban, reason=reason_text)
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.green()
@@ -402,14 +402,8 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     if guild.id not in config.get("federated_guild_ids", []): return
     
     stats = await load_fed_stats()
-    
-    guild_id_str = str(guild.id)
-    if guild_id_str not in stats: stats[guild_id_str] = {}
-    stats[guild_id_str]["bans_initiated_lifetime"] = stats[guild_id_str].get("bans_initiated_lifetime", 0) + 1
     current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
-    if "monthly_initiated" not in stats[guild_id_str]: stats[guild_id_str]["monthly_initiated"] = {}
-    stats[guild_id_str]["monthly_initiated"][current_month_key] = stats[guild_id_str]["monthly_initiated"].get(current_month_key, 0) + 1
-    
+        
     moderator, ban_reason = None, "No reason provided."
     await asyncio.sleep(2)
 
@@ -482,14 +476,21 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     else:
         logger.info(f"Ban of {user} in {guild.name} was by an unauthorized bot ({moderator.name}).")
         return
+    
     if not is_authorized:
         logger.warning(f"Ban of {user} by {moderator} did not pass authorization checks.")
         return
     
-    # If no detailed context was found (e.g., manual ban or failed alert fetch),
-    # use the audit log reason as the context.
+    guild_id_str = str(guild.id)
+    if guild_id_str not in stats: stats[guild_id_str] = {}
+    stats[guild_id_str]["bans_initiated_lifetime"] = stats[guild_id_str].get("bans_initiated_lifetime", 0) + 1
+    if "monthly_initiated" not in stats[guild_id_str]: stats[guild_id_str]["monthly_initiated"] = {}
+    stats[guild_id_str]["monthly_initiated"][current_month_key] = stats[guild_id_str]["monthly_initiated"].get(current_month_key, 0) + 1
+
     if not detailed_reason_field:
-        detailed_reason_field = {"name": "Ban Reason", "value": f"```{ban_reason[:1000]}```"}
+        default_reason = config.get("manual_ban_default_reason", "Scam")
+        display_reason = ban_reason if ban_reason != "No reason provided." else default_reason
+        detailed_reason_field = {"name": "Ban Reason", "value": f"```{display_reason[:1000]}```"}
 
     if "global" not in stats: stats["global"] = {}
     stats["global"]["total_federated_actions_lifetime"] = stats["global"].get("total_federated_actions_lifetime", 0) + 1
@@ -583,10 +584,19 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
         logger.info(f"Unban of {user} in {guild.name} could not be attributed.")
         return
 
+    # Determine the type of unban and if it should be propagated globally.
     is_authorized, authorization_method = False, "Unknown"
-    if moderator.id == bot.user.id:
+    should_propagate = False # Default to local action
+
+    if unban_reason.startswith("[Local Action]"):
+        logger.info(f"Processing local-only unban for {user} in {guild.name}.")
+        is_authorized = True
+        authorization_method = "Local Unban via Federated Alert"
+        should_propagate = False
+    elif moderator.id == bot.user.id:
         if unban_reason.startswith("[Federated Action]"):
             is_authorized, authorization_method = True, "Authorized via Bot Alert"
+            should_propagate = True # This is a global action
         else:
             logger.info(f"Ignoring federated unban echo for {user} in {guild.name}.")
             return
@@ -595,6 +605,7 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
             whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(guild.id), [])
             if any(role.id in whitelisted_mod_roles for role in moderator.roles):
                 is_authorized, authorization_method = True, "Manual Unban by a whitelisted Moderator"
+                should_propagate = True
             else:
                 logger.warning(f"User {user} was unbanned by {moderator}, but they do not have a whitelisted role.")
                 return
@@ -609,56 +620,60 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
         logger.warning(f"Unban of {user} by {moderator} did not pass authorization checks.")
         return
 
+    # Load stats once after authorization is confirmed.
     stats = await load_fed_stats()
+    current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    # The global counter is decremented for any authorized unban (local or global).
     if "global" not in stats: stats["global"] = {}
     stats["global"]["total_federated_actions_lifetime"] = max(0, stats["global"].get("total_federated_actions_lifetime", 0) - 1)
+    
+    # Only enter the propagation block if it's a global action.
+    if should_propagate:
+        log_channel_id = config.get("log_channel_id")
+        log_channel = bot.get_channel(log_channel_id) if log_channel_id else None
+        if log_channel:
+            embed = discord.Embed(title="ℹ️ Federated Unban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Origin:** {guild.name}\n**Authorization:** {authorization_method}", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
+            embed.set_author(name=user.name, icon_url=user.display_avatar.url)
+            await log_channel.send(embed=embed)
 
-    log_channel_id = config.get("log_channel_id")
-    log_channel = bot.get_channel(log_channel_id) if log_channel_id else None
-    if log_channel:
-        embed = discord.Embed(title="ℹ️ Federated Unban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Origin:** {guild.name}\n**Authorization:** {authorization_method}", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
-        embed.set_author(name=user.name, icon_url=user.display_avatar.url)
-        await log_channel.send(embed=embed)
+        logger.info(f"INITIATING FEDERATED (GLOBAL) UNBAN for {user} from origin {guild.name}.")
+        origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(guild.id))
+        if origin_mod_channel_id:
+            origin_mod_channel = guild.get_channel(origin_mod_channel_id)
+            if origin_mod_channel:
+                origin_alert_embed = discord.Embed(title="ℹ️ Federated Unban", description=f"The unban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.", color=discord.Color.light_grey(), timestamp=datetime.now(timezone.utc))
+                await origin_mod_channel.send(embed=origin_alert_embed)
 
-    logger.info(f"INITIATING FEDERATED UNBAN for {user} from origin {guild.name}.")
-    origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(guild.id))
-    if origin_mod_channel_id:
-        origin_mod_channel = guild.get_channel(origin_mod_channel_id)
-        if origin_mod_channel:
-            origin_alert_embed = discord.Embed(title="ℹ️ Federated Unban", description=f"The unban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.", color=discord.Color.light_grey(), timestamp=datetime.now(timezone.utc))
-            await origin_mod_channel.send(embed=origin_alert_embed)
-
-    current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
-    for guild_id in config.get("federated_guild_ids", []):
-        if guild_id == guild.id: continue
-        target_guild = bot.get_guild(guild_id)
-        if not target_guild: continue
-        try:
-            await target_guild.fetch_ban(user)
+        for guild_id in config.get("federated_guild_ids", []):
+            if guild_id == guild.id: continue
+            target_guild = bot.get_guild(guild_id)
+            if not target_guild: continue
             try:
-                await target_guild.unban(user, reason=f"Federated unban from {guild.name}.")
-                logger.info(f"SUCCESS: Unbanned {user} from {target_guild.name}.")
-                if log_channel: await log_channel.send(f"✅ Unbanned `{user}` in `{target_guild.name}`.")
-                
-                target_guild_id_str = str(target_guild.id)
-                if target_guild_id_str in stats:
-                    stats[target_guild_id_str]["bans_received_lifetime"] = max(0, stats[target_guild_id_str].get("bans_received_lifetime", 0) - 1)
-                    if "monthly_received" in stats[target_guild_id_str] and current_month_key in stats[target_guild_id_str]["monthly_received"]:
-                        stats[target_guild_id_str]["monthly_received"][current_month_key] = max(0, stats[target_guild_id_str]["monthly_received"].get(current_month_key, 0) - 1)
-                
-                mod_channel_id = config.get("mod_alert_channels", {}).get(str(target_guild.id))
-                if mod_channel_id:
-                    mod_channel = target_guild.get_channel(mod_channel_id)
-                    if mod_channel:
-                        alert_embed = discord.Embed(title="ℹ️ Federated Unban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Action:** Automatically unbanned from this server.\n**Origin:** **{guild.name}**", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-                        allowed_mentions = discord.AllowedMentions(users=[user])
-                        await mod_channel.send(embed=alert_embed, allowed_mentions=allowed_mentions)
-            except Exception as e:
-                logger.error(f"Error during federated unban propagation to {target_guild.name}: {e}", exc_info=True)
-                if log_channel: await log_channel.send(f"❌ Failed to unban `{user}` in `{target_guild.name}` - Error: `{e}`")
-        except discord.NotFound:
-            logger.info(f"User {user} was not banned in {target_guild.name}. No unban action needed.")
-            continue
+                await target_guild.fetch_ban(user)
+                try:
+                    await target_guild.unban(user, reason=f"Federated unban from {guild.name}.")
+                    logger.info(f"SUCCESS: Unbanned {user} from {target_guild.name}.")
+                    if log_channel: await log_channel.send(f"✅ Unbanned `{user}` in `{target_guild.name}`.")
+                    
+                    target_guild_id_str = str(target_guild.id)
+                    if target_guild_id_str in stats:
+                        stats[target_guild_id_str]["bans_received_lifetime"] = max(0, stats[target_guild_id_str].get("bans_received_lifetime", 0) - 1)
+                        if "monthly_received" in stats[target_guild_id_str] and current_month_key in stats[target_guild_id_str]["monthly_received"]:
+                            stats[target_guild_id_str]["monthly_received"][current_month_key] = max(0, stats[target_guild_id_str]["monthly_received"].get(current_month_key, 0) - 1)
+                    
+                    mod_channel_id = config.get("mod_alert_channels", {}).get(str(target_guild.id))
+                    if mod_channel_id:
+                        mod_channel = target_guild.get_channel(mod_channel_id)
+                        if mod_channel:
+                            alert_embed = discord.Embed(title="ℹ️ Federated Unban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Action:** Automatically unbanned from this server.\n**Origin:** **{guild.name}**", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+                            await mod_channel.send(embed=alert_embed)
+                except Exception as e:
+                    logger.error(f"Error during federated unban propagation to {target_guild.name}: {e}", exc_info=True)
+                    if log_channel: await log_channel.send(f"❌ Failed to unban `{user}` in `{target_guild.name}` - Error: `{e}`")
+            except discord.NotFound:
+                logger.info(f"User {user} was not banned in {target_guild.name}. No unban action needed.")
+                continue
     
     await save_fed_stats(stats)
 
@@ -1011,7 +1026,7 @@ async def bancounter(interaction: discord.Interaction):
     embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
     embed.add_field(name="Bans Initiated from This Server", value=f"**`{bans_initiated_monthly}`** (This Month)\n**`{bans_initiated_lifetime}`** (All Time)", inline=False)
     embed.add_field(name="Bans Received in This Server", value=f"**`{bans_received_monthly}`** (This Month)\n**`{bans_received_lifetime}`** (All Time)", inline=False)
-    embed.add_field(name="Total Network Actions (All Time)", value=f"**`{total_federated_actions_lifetime}`**\n*Total federated bans across all servers.*", inline=False)
+    embed.add_field(name="Total Federated Bans (All Time)", value=f"**`{total_federated_actions_lifetime}`**\n*Total federated bans across all servers.*", inline=False)
     await interaction.followup.send(embed=embed)
 
 def format_keyword_list(ruleset: dict, list_title: str) -> str:
