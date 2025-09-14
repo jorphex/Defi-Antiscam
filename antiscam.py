@@ -65,39 +65,47 @@ def save_keywords(keywords_data: dict):
     with open(KEYWORDS_FILE, 'w', encoding='utf-8') as f:
         json.dump(keywords_data, f, indent=4)
 
-def check_text_for_keywords(text_to_check: str, keywords_data: dict, check_type: str) -> list:
-    if not text_to_check or not keywords_data: return []
+def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list:
+    """
+    Checks a given string against a specific ruleset (e.g., username rules or bio rules).
+    """
+    if not text_to_check or not ruleset:
+        return []
+
     triggered = []
     normalized_text = unidecode(text_to_check).lower()
-    if check_type == 'username':
-        username_rules = keywords_data.get("username_keywords", {})
-        for keyword in username_rules.get("substring", []):
-            if keyword.lower() in normalized_text:
-                triggered.append(keyword)
-        for keyword in username_rules.get("smart", []):
-            pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
-            if re.search(pattern, normalized_text):
-                triggered.append(keyword)
-    elif check_type == 'bio_and_message':
-        rules = keywords_data.get("bio_and_message_keywords", {})
-        for keyword in rules.get("simple_keywords", []):
-            pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
-            if re.search(pattern, normalized_text):
-                triggered.append(keyword)
-        texts_to_scan_regex = {text_to_check, normalized_text}
-        for pattern in rules.get("regex_patterns", []):
-            try:
-                for text in texts_to_scan_regex:
-                    if re.search(pattern, text, re.IGNORECASE):
-                        if "Matched Regex Pattern" not in triggered:
-                            triggered.append("Matched Regex Pattern")
-                        break
-            except re.error as e:
-                logger.warning(f"Invalid regex pattern in {KEYWORDS_FILE}: '{pattern}' - {e}")
-                continue
+
+    # Username checks (substring and smart)
+    for keyword in ruleset.get("username_keywords", {}).get("substring", []):
+        if keyword.lower() in normalized_text:
+            triggered.append(keyword)
+    for keyword in ruleset.get("username_keywords", {}).get("smart", []):
+        pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
+        if re.search(pattern, normalized_text):
+            triggered.append(keyword)
+
+    # Bio/Message checks (simple and regex)
+    bio_rules = ruleset.get("bio_and_message_keywords", {})
+    for keyword in bio_rules.get("simple_keywords", []):
+        pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
+        if re.search(pattern, normalized_text):
+            triggered.append(keyword)
+    
+    texts_to_scan_regex = {text_to_check, normalized_text}
+    for pattern in bio_rules.get("regex_patterns", []):
+        try:
+            for txt in texts_to_scan_regex:
+                if re.search(pattern, txt, re.IGNORECASE):
+                    if "Matched Regex Pattern" not in triggered:
+                        triggered.append("Matched Regex Pattern")
+                    break
+        except re.error as e:
+            logger.warning(f"Invalid regex pattern in {KEYWORDS_FILE}: '{pattern}' - {e}")
+            continue
+            
     return list(set(triggered))
 
-# --- UI CLASSES ---
+# --- UI ---
 class ScreeningView(discord.ui.View):
     def __init__(self, flagged_member_id: int):
         super().__init__(timeout=None)
@@ -200,10 +208,8 @@ class ScreeningView(discord.ui.View):
             except Exception as e:
                 logger.warning(f"Could not remove timeout for {member.name} on ignore: {e}")
         try:
-            confirmation_message = await interaction.followup.send("✅ Alert dismissed.")
+            await interaction.followup.send("✅ Alert dismissed.", ephemeral=True)
             await interaction.message.delete()
-            await asyncio.sleep(5)
-            await confirmation_message.delete()
         except Exception as e:
             logger.error(f"Failed to delete screening message: {e}", exc_info=True)
             if not interaction.is_done():
@@ -282,50 +288,71 @@ async def on_ready():
 async def on_member_join(member: discord.Member):
     config = load_federation_config()
     if member.guild.id not in config.get("federated_guild_ids", []): return
+    
     await asyncio.sleep(2)
     try:
         member = await member.guild.fetch_member(member.id)
     except discord.NotFound:
         logger.warning(f"Member {member.name} left before they could be processed.")
         return
+
     whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(member.guild.id), [])
     if any(role.id in whitelisted_roles for role in member.roles):
         logger.info(f"Member {member.name} has a whitelisted role. Skipping screen.")
         return
-    await screen_member(member, config)
+
+    result = await screen_member(member, config)
+
+    if result.get("flagged"):
+        logger.info(f"FLAGGED member on join: {member.name} in {member.guild.name}.")
+        mod_channel_id = config.get("mod_alert_channels", {}).get(str(member.guild.id))
+        alert_channel = member.guild.get_channel(mod_channel_id) if mod_channel_id else None
         
+        if alert_channel:
+            try:
+                await member.timeout(timedelta(days=1), reason=result.get("timeout_reason"))
+                view = ScreeningView(flagged_member_id=member.id)
+                allowed_mentions = discord.AllowedMentions(users=[member])
+                await alert_channel.send(embed=result.get("embed"), view=view, allowed_mentions=allowed_mentions)
+            except Exception as e:
+                logger.error(f"Failed to take action on flagged member {member.name}: {e}")
+    
+    if not result.get("flagged"):
+        logger.info(f"Member {member.name} in {member.guild.name} passed all screenings.")
+
 @bot.event
 async def on_message(message: discord.Message):
+    """Scans messages in real-time by calling the core screening function."""
     config = load_federation_config()
     if message.author == bot.user or message.interaction_metadata is not None: return
     if not message.guild or message.guild.id not in config.get("federated_guild_ids", []) or message.author.bot: return
     if not isinstance(message.author, discord.Member): return
+    
     whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(message.guild.id), [])
     if any(role.id in whitelisted_roles for role in message.author.roles): return
-    keywords_data = load_keywords()
-    if not keywords_data: return
-    triggered_keywords = check_text_for_keywords(message.content, keywords_data, 'bio_and_message')
-    if triggered_keywords:
+
+    result = await screen_message(message, config)
+
+    if result.get("flagged"):
         author = message.author
-        logger.info(f"FLAGGED message from {author.name} in #{message.channel.name}. Triggered by: {', '.join(triggered_keywords)}")
+        logger.info(f"FLAGGED message from {author.name} in #{message.channel.name}.")
+        
         try: await message.delete()
         except Exception as e: logger.error(f"Error deleting flagged message: {e}")
+        
         try:
-            await author.timeout(timedelta(days=1), reason="Flagged message detected by bot.")
-            logger.info(f"Successfully timed out {author.name} for 1 hour.")
+            await author.timeout(timedelta(days=1), reason=result.get("timeout_reason", "Flagged message."))
         except Exception as e: logger.error(f"Failed to timeout {author.name} for flagged message: {e}")
+        
         mod_channel_id = config.get("mod_alert_channels", {}).get(str(message.guild.id))
-        mod_channel = message.guild.get_channel(mod_channel_id) if mod_channel_id else None
-        if mod_channel:
-            embed = discord.Embed(title="Flagged", description=f"{author.mention} (`{author.id}`) in {message.channel.mention}", color=discord.Color.dark_red(), timestamp=datetime.now(timezone.utc))
-            embed.set_author(name=f"{author.name}", icon_url=author.display_avatar.url)
-            embed.add_field(name="📝 Message", value=f"```{message.content[:1000]}```", inline=False)
-            embed.add_field(name="🚩 Trigger", value=f"`{', '.join(triggered_keywords)}`", inline=True)
-            embed.add_field(name="Status", value="Message deleted. User timed out. Awaiting review...", inline=True)
-            embed.add_field(name="Account Age", value=f"<t:{int(author.created_at.timestamp())}:R>", inline=True)
-            view = ScreeningView(flagged_member_id=author.id)
-            allowed_mentions = discord.AllowedMentions(users=[author])
-            await mod_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
+        alert_channel = message.guild.get_channel(mod_channel_id) if mod_channel_id else None
+        if alert_channel:
+            try:
+                view = ScreeningView(flagged_member_id=author.id)
+                allowed_mentions = discord.AllowedMentions(users=[author])
+                await alert_channel.send(embed=result.get("embed"), view=view, allowed_mentions=allowed_mentions)
+            except Exception as e:
+                logger.error(f"Failed to send message alert for {author.name}: {e}")
 
 @bot.event
 async def on_member_ban(guild: discord.Guild, user: discord.User):
@@ -403,18 +430,23 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                 logger.info(f"SUCCESS: Banned {user} from {target_guild.name}.")
                 if log_channel: await log_channel.send(f"✅ Banned `{user}` in `{target_guild.name}`.")
                 stats = load_fed_stats()
+
                 target_guild_id_str = str(target_guild.id)
                 if target_guild_id_str not in stats: stats[target_guild_id_str] = {}
                 stats[target_guild_id_str]["bans_received_lifetime"] = stats[target_guild_id_str].get("bans_received_lifetime", 0) + 1
                 if "monthly_received" not in stats[target_guild_id_str]: stats[target_guild_id_str]["monthly_received"] = {}
                 stats[target_guild_id_str]["monthly_received"][current_month_key] = stats[target_guild_id_str]["monthly_received"].get(current_month_key, 0) + 1
                 save_fed_stats(stats)
+
                 mod_channel_id = config.get("mod_alert_channels", {}).get(str(target_guild.id))
                 if mod_channel_id:
                     mod_channel = target_guild.get_channel(mod_channel_id)
                     if mod_channel:
                         alert_embed = discord.Embed(title="🛡️ Federated Ban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Action:** Automatically banned from this server.\n**Origin:** **{guild.name}**", color=discord.Color.dark_red(), timestamp=datetime.now(timezone.utc))
-                        await mod_channel.send(embed=alert_embed, view=FederatedAlertView(banned_user_id=user.id)) # FIX: Use ID
+                        view = FederatedAlertView(banned_user_id=user.id)
+                        allowed_mentions = discord.AllowedMentions(users=[user])
+                        await mod_channel.send(embed=alert_embed, view=view, allowed_mentions=allowed_mentions)
+
             except Exception as e:
                 logger.error(f"Error during federated ban propagation to {target_guild.name}: {e}", exc_info=True)
                 if log_channel: await log_channel.send(f"❌ Failed to ban `{user}` in `{target_guild.name}` - Error: `{e}`")
@@ -492,7 +524,8 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
                     mod_channel = target_guild.get_channel(mod_channel_id)
                     if mod_channel:
                         alert_embed = discord.Embed(title="ℹ️ Federated Unban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Action:** Automatically unbanned from this server.\n**Origin:** **{guild.name}**", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-                        await mod_channel.send(embed=alert_embed)
+                        allowed_mentions = discord.AllowedMentions(users=[user])
+                        await mod_channel.send(embed=alert_embed, allowed_mentions=allowed_mentions)
             except Exception as e:
                 logger.error(f"Error during federated unban propagation to {target_guild.name}: {e}", exc_info=True)
                 if log_channel: await log_channel.send(f"❌ Failed to unban `{user}` in `{target_guild.name}` - Error: `{e}`")
@@ -500,15 +533,15 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
             logger.info(f"User {user} was not banned in {target_guild.name}. No unban action needed.")
             continue
 
-# --- CORE LOGIC FUNCTIONS (for commands) ---
-async def screen_member(member: discord.Member, config: dict):
+async def screen_member(member: discord.Member, config: dict) -> dict:
     """
-    Performs the complete screening process for a single member.
-    Checks for federated bans, then keywords, and sends alerts if needed.
-    Returns True if the member was flagged, False otherwise.
+    Performs the complete screening process for a single member and returns the findings.
+    Does NOT perform any actions (timeout, send message).
+    Returns a dictionary with flag status, embed, and timeout reason.
     """
     federated_guild_ids = config.get("federated_guild_ids", [])
     found_bans = []
+
     for other_guild_id in federated_guild_ids:
         if other_guild_id == member.guild.id: continue
         other_guild = bot.get_guild(other_guild_id)
@@ -521,67 +554,104 @@ async def screen_member(member: discord.Member, config: dict):
             continue
         except Exception as e:
             logger.error(f"Error checking ban status for {member.name} in {other_guild.name}: {e}")
+
     if found_bans:
-        logger.info(f"FLAGGED (Federated Ban): {member.name} is banned in {len(found_bans)} other server(s).")
         banned_in_servers = ", ".join([ban['guild_name'] for ban in found_bans])
         timeout_reason = f"Flagged on join: User is banned in partner server(s): {banned_in_servers}."
-        mod_channel_id = config.get("mod_alert_channels", {}).get(str(member.guild.id))
-        mod_channel = member.guild.get_channel(mod_channel_id) if mod_channel_id else None
-        if mod_channel:
-            embed = discord.Embed(title="🚨 New User Banned Elsewhere", description=f"**User:** {member.mention} (`{member.id}`)\nThis user is already banned in **{len(found_bans)}** other federated server(s).", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
-            embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
-            for ban in found_bans:
-                embed.add_field(name=f"Banned In: {ban['guild_name']}", value=f"```{ban['reason'][:1000]}```", inline=False)
-            embed.add_field(name="Status", value="User timed out for 1 hour. Awaiting review...", inline=True)
-            try:
-                await member.timeout(timedelta(days=1), reason=timeout_reason)
-                view = ScreeningView(flagged_member_id=member.id)
-                allowed_mentions = discord.AllowedMentions(users=[member])
-                await mod_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
-            except Exception as e:
-                logger.error(f"Failed to timeout or alert for federated flag on {member.name}: {e}")
-        return True
+
+        embed = discord.Embed(title="🚨 User Banned Elsewhere", description=f"**User:** {member.mention} (`{member.id}`)\nThis user is already banned in **{len(found_bans)}** other federated server(s).", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+        embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
+        for ban in found_bans:
+            embed.add_field(name=f"Banned In: {ban['guild_name']}", value=f"```{ban['reason'][:1000]}```", inline=False)
+        embed.add_field(name="Status", value="User timed out for 1 day. Awaiting review...", inline=True)
+        
+        return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
+
     keywords_data = load_keywords()
-    if not keywords_data: return False
+    if not keywords_data: return {"flagged": False}
+
     try:
         user_profile = await bot.fetch_user(member.id)
         bio = getattr(user_profile, 'bio', "")
     except Exception as e:
         logger.error(f"Error fetching profile for {member.name}: {e}", exc_info=True)
         bio = ""
+
+    triggered_keywords = []
     name_text = f"{user_profile.name} {member.nick or ''}"
-    triggered_by_name = check_text_for_keywords(name_text, keywords_data, 'username')
-    triggered_by_bio = check_text_for_keywords(bio, keywords_data, 'bio_and_message')
-    triggered_keywords = list(set(triggered_by_name + triggered_by_bio))
+    
+    local_rules = keywords_data.get("per_server_keywords", {}).get(str(member.guild.id), {})
+    global_rules = keywords_data.get("global_keywords", {})
+
+    local_username_rules = {"username_keywords": local_rules.get("username_keywords", {})}
+    global_username_rules = {"username_keywords": global_rules.get("username_keywords", {})}
+    triggered_keywords.extend(check_text_for_keywords(name_text, local_username_rules))
+    triggered_keywords.extend(check_text_for_keywords(name_text, global_username_rules))
+
+    local_bio_rules = {"bio_and_message_keywords": local_rules.get("bio_and_message_keywords", {})}
+    global_bio_rules = {"bio_and_message_keywords": global_rules.get("bio_and_message_keywords", {})}
+    triggered_keywords.extend(check_text_for_keywords(bio, local_bio_rules))
+    triggered_keywords.extend(check_text_for_keywords(bio, global_bio_rules))
+
+    triggered_keywords = list(set(triggered_keywords))
+
     if triggered_keywords:
-        logger.info(f"FLAGGED (Keywords): user {member.name} for keywords: {', '.join(triggered_keywords)}")
-        mod_channel_id = config.get("mod_alert_channels", {}).get(str(member.guild.id))
-        mod_channel = member.guild.get_channel(mod_channel_id) if mod_channel_id else None
-        if mod_channel:
-            embed = discord.Embed(title="🚨 Flagged User (Keywords)", description=f"{member.mention} (`{member.id}`)", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
-            embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
-            if bio:
-                embed.add_field(name="📝 Bio", value=bio[:1024], inline=False)
-            embed.add_field(name="🚩 Trigger", value=f"`{', '.join(triggered_keywords)}`", inline=True)
-            embed.add_field(name="Status", value="User timed out for 1 hour. Awaiting review...", inline=True)
-            embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
-            try:
-                await member.timeout(timedelta(days=1), reason="Flagged by keyword screening on join.")
-                view = ScreeningView(flagged_member_id=member.id)
-                allowed_mentions = discord.AllowedMentions(users=[member])
-                await mod_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
-            except Exception as e:
-                logger.error(f"Failed to timeout or alert for keyword flag on {member.name}: {e}")
-        return True
-    logger.info(f"Member {member.name} passed all screenings. No action taken.")
-    return False
+        timeout_reason = "Flagged by keyword screening."
+        
+        embed = discord.Embed(title="🚨 Flagged User", description=f"{member.mention} (`{member.id}`)", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+        embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
+        if bio:
+            embed.add_field(name="📝 Bio", value=bio[:1024], inline=False)
+        embed.add_field(name="🚩 Trigger", value=f"`{', '.join(triggered_keywords)}`", inline=True)
+        embed.add_field(name="Status", value="User timed out for 1 day. Awaiting review...", inline=True)
+        embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+        
+        return {"flagged": True, "embed": embed, "timeout_reason": "Flagged by keyword screening."}
+
+    return {"flagged": False}
+
+async def screen_message(message: discord.Message, config: dict) -> dict:
+    """
+    Performs the screening process for a single message and returns the findings.
+    Does NOT perform any actions (delete, timeout, send message).
+    """
+    keywords_data = load_keywords()
+    if not keywords_data:
+        return {"flagged": False}
+
+    triggered_keywords = []
+    local_rules = keywords_data.get("per_server_keywords", {}).get(str(message.guild.id), {})
+    global_rules = keywords_data.get("global_keywords", {})
+    local_message_rules = {"bio_and_message_keywords": local_rules.get("bio_and_message_keywords", {})}
+    global_message_rules = {"bio_and_message_keywords": global_rules.get("bio_and_message_keywords", {})}
+    triggered_keywords.extend(check_text_for_keywords(message.content, local_message_rules))
+    triggered_keywords.extend(check_text_for_keywords(message.content, global_message_rules))
+    triggered_keywords = list(set(triggered_keywords))
+
+    if triggered_keywords:
+        embed = discord.Embed(
+            title="🚨 Flagged Message",
+            description=f"**User:** {message.author.mention} (`{message.author.id}`)\n"
+                        f"**Channel:** {message.channel.mention}",
+            color=discord.Color.dark_red(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_author(name=f"{message.author.name}", icon_url=message.author.display_avatar.url)
+        embed.add_field(name="📝 Flagged Message", value=f"```{message.content[:1000]}```", inline=False)
+        embed.add_field(name="🚩 Trigger", value=f"`{', '.join(triggered_keywords)}`", inline=True)
+        embed.add_field(name="Status", value="Message deleted. User timed out. Awaiting review...", inline=True)
+        embed.add_field(name="Account Age", value=f"<t:{int(message.author.created_at.timestamp())}:R>", inline=True)
+        
+        return {"flagged": True, "embed": embed, "timeout_reason": "Flagged message detected by bot."}
+    return {"flagged": False}
 
 async def run_full_scan(interaction: discord.Interaction):
-    """The long-running task that performs the full member scan."""
     config = load_federation_config()
     guild = interaction.guild
+    
     results_channel_id = config.get("mod_scan_results_channels", {}).get(str(guild.id))
     results_channel = guild.get_channel(results_channel_id)
+
     if not results_channel:
         await interaction.followup.send(f"❌ **Scan Aborted:** Scan results channel not configured for {guild.name}.", ephemeral=True)
         if guild.id in active_scans: del active_scans[guild.id]
@@ -603,9 +673,18 @@ async def run_full_scan(interaction: discord.Interaction):
             whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(guild.id), [])
             if any(role.id in whitelisted_roles for role in member.roles):
                 continue
-            was_flagged = await screen_member(member, config)
-            if was_flagged:
+            result = await screen_member(member, config)
+            
+            if result.get("flagged"):
                 flagged_count += 1
+                try:
+                    await member.timeout(timedelta(days=1), reason=result.get("timeout_reason", "Flagged by scan."))
+                    view = ScreeningView(flagged_member_id=member.id)
+                    allowed_mentions = discord.AllowedMentions(users=[member])
+                    await results_channel.send(embed=result.get("embed"), view=view, allowed_mentions=allowed_mentions)
+
+                except Exception as e:
+                    logger.error(f"Failed to take action on scanned member {member.name}: {e}")
             if checked_count % update_interval == 0:
                 progress_text = f"Scan in progress... {checked_count}/{total_members} members checked. **{flagged_count}** flagged so far."
                 await progress_message.edit(content=f"🔍 {progress_text}")
@@ -629,24 +708,177 @@ async def run_full_scan(interaction: discord.Interaction):
             del active_scans[guild.id]
             logger.info(f"Scan task for guild {guild.id} removed from active tracker.")
 
-# --- SLASH COMMANDS ---
-@bot.tree.command(name="reloadconfig", description="[Owner Only] Reloads the federation configuration file.")
+
+# --- OWNER SLASH COMMANDS ---
+@bot.tree.command(name="zreloadconfig", description="[Owner Only] Reloads federation config and updates keyword file.")
 async def reloadconfig(interaction: discord.Interaction):
     if not await bot.is_owner(interaction.user):
         await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
         return
-    logger.info(f"OWNER COMMAND: {interaction.user.name} triggered a configuration reload.")
-    config = load_federation_config()
-    if config:
-        await interaction.response.send_message(f"✅ **Configuration reloaded successfully.**\nNow managing **{len(config.get('federated_guild_ids', []))}** federated servers.", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ **Failed to reload configuration.** Check logs for errors with `federation_config.json`.", ephemeral=True)
 
+    await interaction.response.defer(ephemeral=True)
+    logger.info(f"OWNER COMMAND: {interaction.user.name} triggered a configuration reload.")
+    
+    config = load_federation_config()
+    keywords_data = load_keywords()
+    
+    if not config or keywords_data is None:
+        await interaction.followup.send("❌ **Failed to reload.** Check logs for errors with config or keyword files.")
+        return
+
+    federated_guild_ids = config.get("federated_guild_ids", [])
+    server_keywords = keywords_data.get("per_server_keywords", {})
+    updated = False
+
+    for guild_id in federated_guild_ids:
+        guild_id_str = str(guild_id)
+        if guild_id_str not in server_keywords:
+            logger.info(f"New server ID {guild_id_str} found in config. Populating keywords.json...")
+            server_keywords[guild_id_str] = {
+                "username_keywords": {"substring": [], "smart": []},
+                "bio_and_message_keywords": {"simple_keywords": [], "regex_patterns": []}
+            }
+            updated = True
+    
+    if updated:
+        save_keywords(keywords_data)
+
+    await interaction.followup.send(
+        f"✅ **Configuration reloaded successfully.**\n"
+        f"Now managing **{len(federated_guild_ids)}** federated servers.\n"
+        f"{'Keyword file was updated with new server entries.' if updated else 'No new servers found to add.'}"
+    )
+
+async def add_global_keyword_to_list(interaction: discord.Interaction, keyword: str, primary_key: str, secondary_key: str = None):
+    """A helper to add a keyword to a specific GLOBAL list in the keywords.json file."""
+    keyword = keyword.lower().strip()
+    if not keyword:
+        await interaction.followup.send("❌ Keyword cannot be empty.")
+        return
+
+    keywords_data = load_keywords()
+    if keywords_data is None:
+        await interaction.followup.send("❌ Could not load the keywords file. Please check the bot's logs.")
+        return
+
+    global_keywords = keywords_data.get("global_keywords", {})
+    
+    target_list = None
+    if secondary_key:
+        if primary_key not in global_keywords: global_keywords[primary_key] = {}
+        if secondary_key not in global_keywords[primary_key]: global_keywords[primary_key][secondary_key] = []
+        target_list = global_keywords[primary_key][secondary_key]
+    else:
+        if primary_key not in global_keywords: global_keywords[primary_key] = []
+        target_list = global_keywords[primary_key]
+
+    if keyword in target_list:
+        await interaction.followup.send(f"⚠️ The keyword '{keyword}' is already in the global list.")
+        return
+
+    target_list.append(keyword)
+    keywords_data["global_keywords"] = global_keywords
+    save_keywords(keywords_data)
+
+    logger.info(f"OWNER {interaction.user.name} added global keyword '{keyword}'.")
+    await interaction.followup.send(f"✅ Keyword '{keyword}' has been successfully added to the GLOBAL list.")
+
+async def remove_global_keyword_from_list(interaction: discord.Interaction, keyword: str, primary_key: str, secondary_key: str = None):
+    """A helper to remove a keyword from a specific GLOBAL list in the keywords.json file."""
+    keyword = keyword.lower().strip()
+    if not keyword:
+        await interaction.followup.send("❌ Keyword cannot be empty.")
+        return
+
+    keywords_data = load_keywords()
+    global_keywords = keywords_data.get("global_keywords", {})
+    
+    target_list = None
+    if secondary_key:
+        target_list = global_keywords.get(primary_key, {}).get(secondary_key, [])
+    else:
+        target_list = global_keywords.get(primary_key, [])
+
+    if keyword in target_list:
+        target_list.remove(keyword)
+        save_keywords(keywords_data)
+        logger.info(f"OWNER {interaction.user.name} removed global keyword '{keyword}'.")
+        await interaction.followup.send(f"✅ Keyword '{keyword}' has been removed from the GLOBAL list.")
+    else:
+        await interaction.followup.send(f"❌ Keyword '{keyword}' was not found in the GLOBAL list.")
+
+# --- OWNER GLOBAL KEYWORD COMMANDS ---
+@bot.tree.command(name="zadd-global-name-substring", description="[Owner Only] Adds a SUBSTRING keyword to the GLOBAL list.")
+@discord.app_commands.describe(keyword="The keyword to add globally (e.g., 'admin').")
+async def add_global_username_substring(interaction: discord.Interaction, keyword: str):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await add_global_keyword_to_list(interaction, keyword, "username_keywords", "substring")
+
+@bot.tree.command(name="zadd-global-name-smart", description="[Owner Only] Adds a SMART keyword to the GLOBAL list.")
+@discord.app_commands.describe(keyword="The keyword to add globally (e.g., 'mod').")
+async def add_global_username_smart(interaction: discord.Interaction, keyword: str):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await add_global_keyword_to_list(interaction, keyword, "username_keywords", "smart")
+
+@bot.tree.command(name="zadd-global-bio-keyword", description="[Owner Only] Adds a BIO keyword to the GLOBAL list.")
+@discord.app_commands.describe(keyword="The keyword or phrase to add globally.")
+async def add_global_bio_keyword(interaction: discord.Interaction, keyword: str):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await add_global_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
+
+# --- OWNER GLOBAL REGEX COMMANDS ---
+@bot.tree.command(name="zadd-global-regex", description="[OWNER ONLY] Adds a regex pattern to the GLOBAL list.")
+@discord.app_commands.describe(pattern="The exact regex pattern to add globally.")
+async def add_global_regex(interaction: discord.Interaction, pattern: str):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await add_regex_to_list(interaction, pattern, is_global=True)
+
+@bot.tree.command(name="zrm-global-name-substring", description="[Owner Only] Removes a SUBSTRING keyword from the GLOBAL list.")
+@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+async def remove_global_username_substring(interaction: discord.Interaction, keyword: str):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "substring")
+
+@bot.tree.command(name="zrm-global-name-smart", description="[Owner Only] Removes a SMART keyword from the GLOBAL list.")
+@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+async def remove_global_username_smart(interaction: discord.Interaction, keyword: str):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "smart")
+
+@bot.tree.command(name="zrm-global-bio-keyword", description="[Owner Only] Removes a BIO keyword from the GLOBAL list.")
+@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+async def remove_global_bio_keyword(interaction: discord.Interaction, keyword: str):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await remove_global_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
+
+@bot.tree.command(name="zrm-global-regex", description="[OWNER ONLY] Removes a regex pattern from the GLOBAL list.")
+@discord.app_commands.describe(pattern="The exact regex pattern to remove globally.")
+async def remove_global_regex(interaction: discord.Interaction, pattern: str):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await remove_regex_from_list(interaction, pattern, is_global=True)
+
+# --- MODERATOR SLASH COMMANDS ---
 @bot.tree.command(name="bancounter", description="Displays local and federated ban statistics.")
 async def bancounter(interaction: discord.Interaction):
     config = load_federation_config()
     if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer()
     stats = load_fed_stats()
     guild_id_str = str(interaction.guild.id)
     current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
@@ -663,31 +895,102 @@ async def bancounter(interaction: discord.Interaction):
     embed.add_field(name="Total Network Actions (All Time)", value=f"**`{total_federated_actions_lifetime}`**\n*Total federated bans across all servers.*", inline=False)
     await interaction.followup.send(embed=embed)
 
+def format_keyword_list(ruleset: dict, list_title: str) -> str:
+    """Helper to format a keyword set into a readable string for Discord."""
+    output = f"**{list_title}**\n"
+    has_keywords = False
+    
+    substring_keywords = ruleset.get("username_keywords", {}).get("substring", [])
+    if substring_keywords:
+        has_keywords = True
+        output += f"__Username (Substring Match):__\n`{', '.join(substring_keywords)}`\n"
+        
+    smart_keywords = ruleset.get("username_keywords", {}).get("smart", [])
+    if smart_keywords:
+        has_keywords = True
+        output += f"__Username (Smart Match):__\n`{', '.join(smart_keywords)}`\n"
+        
+    bio_keywords = ruleset.get("bio_and_message_keywords", {}).get("simple_keywords", [])
+    if bio_keywords:
+        has_keywords = True
+        output += f"__Bio & Message (Smart Match):__\n`{', '.join(bio_keywords)}`\n"
+        
+    regex_patterns = ruleset.get("bio_and_message_keywords", {}).get("regex_patterns", [])
+    if regex_patterns:
+        has_keywords = True
+        
+        bulleted_patterns = '\n'.join([f"- `{pattern}`" for pattern in regex_patterns])
+        
+        output += f"__Bio & Message (Regex):__\n{bulleted_patterns}\n"
+
+    if not has_keywords:
+        output += "*No keywords configured in this category.*\n"
+        
+    return output + "\n"
+
+@bot.tree.command(name="list-keywords", description="Lists all active screening keywords for this server.")
+async def list_keywords(interaction: discord.Interaction):
+    config = load_federation_config()
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+
+    keywords_data = load_keywords()
+    guild_id_str = str(interaction.guild.id)
+
+    local_rules = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {})
+    local_output = format_keyword_list(local_rules, "🔑 Local Keywords for this Server")
+
+    global_rules = keywords_data.get("global_keywords", {})
+    global_output = format_keyword_list(global_rules, "🌍 Global Keywords (Applied to all Servers)")
+
+    embed = discord.Embed(
+        title=f"Screening Keywords for {interaction.guild.name}",
+        description=local_output + global_output,
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    await interaction.followup.send(embed=embed)
+
 async def add_keyword_to_list(interaction: discord.Interaction, keyword: str, primary_key: str, secondary_key: str = None):
+    """A generic helper to add a keyword to a specific LOCAL list in the keywords.json file."""
     keyword = keyword.lower().strip()
     if not keyword:
         await interaction.followup.send("❌ Keyword cannot be empty.")
         return
+
     keywords_data = load_keywords()
-    if keywords_data is None:
-        await interaction.followup.send("❌ Could not load the keywords file. Please check the bot's logs.")
-        return
+    guild_id_str = str(interaction.guild.id)
+
+    if "per_server_keywords" not in keywords_data:
+        keywords_data["per_server_keywords"] = {}
+    if guild_id_str not in keywords_data["per_server_keywords"]:
+        keywords_data["per_server_keywords"][guild_id_str] = {
+            "username_keywords": {"substring": [], "smart": []},
+            "bio_and_message_keywords": {"simple_keywords": [], "regex_patterns": []}
+        }
+    
+    server_keywords = keywords_data["per_server_keywords"][guild_id_str]
+    
+    target_list = None
     if secondary_key:
-        if primary_key not in keywords_data: keywords_data[primary_key] = {}
-        if secondary_key not in keywords_data[primary_key]: keywords_data[primary_key][secondary_key] = []
-        target_list = keywords_data[primary_key][secondary_key]
+        if primary_key not in server_keywords: server_keywords[primary_key] = {}
+        if secondary_key not in server_keywords[primary_key]: server_keywords[primary_key][secondary_key] = []
+        target_list = server_keywords[primary_key][secondary_key]
     else:
-        if primary_key not in keywords_data: keywords_data[primary_key] = []
-        target_list = keywords_data[primary_key]
+        if primary_key not in server_keywords: server_keywords[primary_key] = []
+        target_list = server_keywords[primary_key]
+
     if keyword in target_list:
-        await interaction.followup.send(f"⚠️ The keyword '{keyword}' is already in that list.")
+        await interaction.followup.send(f"⚠️ The keyword '{keyword}' is already in this server's local list.")
         return
+
     target_list.append(keyword)
     save_keywords(keywords_data)
-    logger.info(f"Moderator {interaction.user.name} added keyword '{keyword}' to {primary_key}{' -> ' + secondary_key if secondary_key else ''}")
-    await interaction.followup.send(f"✅ Keyword '{keyword}' has been successfully added.")
 
-@bot.tree.command(name="add-username-keyword-substring", description="Aggressive name keyword (catches variations: 'admin' in 'daoadmin' 'admin123').")
+    logger.info(f"Moderator {interaction.user.name} in {interaction.guild.name} added keyword '{keyword}'.")
+    await interaction.followup.send(f"✅ Keyword '{keyword}' has been added to this server's local list.")
+
+@bot.tree.command(name="add-name-keyword-substring", description="Aggressive name keyword (catches variations: 'admin' in 'daoadmin' 'admin123').")
 @discord.app_commands.describe(keyword="Example: 'admin' will match 'listadaoadmin' or 'admin123'.")
 async def add_username_keyword_substring(interaction: discord.Interaction, keyword: str):
     config = load_federation_config()
@@ -695,7 +998,7 @@ async def add_username_keyword_substring(interaction: discord.Interaction, keywo
     await interaction.response.defer(ephemeral=True)
     await add_keyword_to_list(interaction, keyword, "username_keywords", "substring")
 
-@bot.tree.command(name="add-username-keyword-smart", description="Precise name keyword (avoids false positives: 'mod' in 'mod123' not 'modern').")
+@bot.tree.command(name="add-name-keyword-smart", description="Precise name keyword (avoids false positives: 'mod' in 'mod123' not 'modern').")
 @discord.app_commands.describe(keyword="Example: 'mod' will match 'mod123' but IGNORE 'modern'.")
 async def add_username_keyword_smart(interaction: discord.Interaction, keyword: str):
     config = load_federation_config()
@@ -710,6 +1013,151 @@ async def add_bio_keyword(interaction: discord.Interaction, keyword: str):
     if not await has_federated_mod_role(interaction, config): return
     await interaction.response.defer(ephemeral=True)
     await add_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
+
+async def add_regex_to_list(interaction: discord.Interaction, pattern: str, is_global: bool):
+    """A helper to add a regex pattern to the appropriate list after validating it."""
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        logger.warning(f"Moderator {interaction.user.name} tried to add an invalid regex: {pattern}. Error: {e}")
+        await interaction.followup.send(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`\nPlease test your pattern with `/test-regex` first.")
+        return
+
+    keywords_data = load_keywords()
+    if is_global:
+        target_list = keywords_data.get("global_keywords", {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        list_name = "GLOBAL"
+    else:
+        guild_id_str = str(interaction.guild.id)
+        server_keywords = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {})
+        target_list = server_keywords.get("bio_and_message_keywords", {}).get("regex_patterns", [])
+
+        if "per_server_keywords" not in keywords_data: keywords_data["per_server_keywords"] = {}
+        if guild_id_str not in keywords_data["per_server_keywords"]: keywords_data["per_server_keywords"][guild_id_str] = {}
+        if "bio_and_message_keywords" not in keywords_data["per_server_keywords"][guild_id_str]: keywords_data["per_server_keywords"][guild_id_str]["bio_and_message_keywords"] = {}
+        if "regex_patterns" not in keywords_data["per_server_keywords"][guild_id_str]["bio_and_message_keywords"]: keywords_data["per_server_keywords"][guild_id_str]["bio_and_message_keywords"]["regex_patterns"] = []
+        target_list = keywords_data["per_server_keywords"][guild_id_str]["bio_and_message_keywords"]["regex_patterns"]
+        list_name = "local"
+
+    if pattern in target_list:
+        await interaction.followup.send(f"⚠️ That regex pattern is already in the {list_name} list.")
+        return
+
+    target_list.append(pattern)
+    save_keywords(keywords_data)
+    logger.info(f"User {interaction.user.name} added {list_name} regex: '{pattern}'")
+    await interaction.followup.send(f"✅ Regex pattern has been successfully added to the **{list_name}** list.")
+
+
+
+@bot.tree.command(name="test-regex", description="Tests a regex pattern against sample text without saving it.")
+@discord.app_commands.describe(pattern="The regex pattern to test.", sample_text="The text to test the pattern against.")
+async def test_regex(interaction: discord.Interaction, pattern: str, sample_text: str):
+    config = load_federation_config()
+    if not await has_federated_mod_role(interaction, config): return
+    
+    try:
+        re.compile(pattern)
+        match = re.search(pattern, sample_text, re.IGNORECASE)
+        
+        if match:
+            embed = discord.Embed(title="✅ Regex Test: Match Found", color=discord.Color.green())
+            embed.add_field(name="Pattern", value=f"`{pattern}`", inline=False)
+            embed.add_field(name="Sample Text", value=f"```{sample_text}```", inline=False)
+            embed.add_field(name="Matched Text", value=f"`{match.group(0)}`", inline=False)
+        else:
+            embed = discord.Embed(title="❌ Regex Test: No Match", color=discord.Color.orange())
+            embed.add_field(name="Pattern", value=f"`{pattern}`", inline=False)
+            embed.add_field(name="Sample Text", value=f"```{sample_text}```", inline=False)
+            
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    except re.error as e:
+        await interaction.response.send_message(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`", ephemeral=True)
+
+@bot.tree.command(name="add-regex", description="Adds a regex pattern to this server's local list. Try /test-regex first!")
+@discord.app_commands.describe(pattern="The exact regex pattern to add. Must be double-escaped for backslashes.")
+async def add_local_regex(interaction: discord.Interaction, pattern: str):
+    config = load_federation_config()
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await add_regex_to_list(interaction, pattern, is_global=False)
+
+@bot.tree.command(name="rm-regex", description="Removes a regex pattern from this server's local list.")
+@discord.app_commands.describe(pattern="The exact regex pattern to remove.")
+async def remove_local_regex(interaction: discord.Interaction, pattern: str):
+    config = load_federation_config()
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await remove_regex_from_list(interaction, pattern, is_global=False)
+
+async def remove_keyword_from_list(interaction: discord.Interaction, keyword: str, primary_key: str, secondary_key: str = None):
+    keyword = keyword.lower().strip()
+    if not keyword:
+        await interaction.followup.send("❌ Keyword cannot be empty.")
+        return
+
+    keywords_data = load_keywords()
+    guild_id_str = str(interaction.guild.id)
+    
+    server_keywords = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {})
+    
+    target_list = None
+    if secondary_key:
+        target_list = server_keywords.get(primary_key, {}).get(secondary_key, [])
+    else:
+        target_list = server_keywords.get(primary_key, [])
+
+    if keyword in target_list:
+        target_list.remove(keyword)
+        save_keywords(keywords_data)
+        logger.info(f"Moderator {interaction.user.name} in {interaction.guild.name} removed keyword '{keyword}'.")
+        await interaction.followup.send(f"✅ Keyword '{keyword}' has been removed from this server's local list.")
+    else:
+        await interaction.followup.send(f"❌ Keyword '{keyword}' was not found in this server's local list.")
+
+@bot.tree.command(name="rm-name-keyword-substring", description="Removes a SUBSTRING keyword from this server's local list.")
+@discord.app_commands.describe(keyword="The exact keyword to remove.")
+async def remove_username_keyword_substring(interaction: discord.Interaction, keyword: str):
+    config = load_federation_config()
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await remove_keyword_from_list(interaction, keyword, "username_keywords", "substring")
+
+@bot.tree.command(name="rm-name-keyword-smart", description="Removes a SMART keyword from this server's local list.")
+@discord.app_commands.describe(keyword="The exact keyword to remove.")
+async def remove_username_keyword_smart(interaction: discord.Interaction, keyword: str):
+    config = load_federation_config()
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await remove_keyword_from_list(interaction, keyword, "username_keywords", "smart")
+
+@bot.tree.command(name="rm-bio-keyword", description="Removes a keyword from this server's local bio/message list.")
+@discord.app_commands.describe(keyword="The exact keyword or phrase to remove.")
+async def remove_bio_keyword(interaction: discord.Interaction, keyword: str):
+    config = load_federation_config()
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await remove_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
+
+async def remove_regex_from_list(interaction: discord.Interaction, pattern: str, is_global: bool):
+    """A helper to remove a regex pattern from the appropriate list."""
+    keywords_data = load_keywords()
+    if is_global:
+        target_list = keywords_data.get("global_keywords", {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        list_name = "GLOBAL"
+    else:
+        guild_id_str = str(interaction.guild.id)
+        target_list = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        list_name = "local"
+
+    if pattern in target_list:
+        target_list.remove(pattern)
+        save_keywords(keywords_data)
+        logger.info(f"User {interaction.user.name} removed {list_name} regex: '{pattern}'")
+        await interaction.followup.send(f"✅ Regex pattern has been removed from the **{list_name}** list.")
+    else:
+        await interaction.followup.send(f"❌ That regex pattern was not found in the {list_name} list.")
 
 @bot.tree.command(name="scanallmembers", description="Retroactively scans all server members against the screening list.")
 async def scanallmembers(interaction: discord.Interaction):
@@ -740,7 +1188,6 @@ async def stopscan(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ℹ️ No scan is currently in progress.", ephemeral=True)
 
-# --- Helper for federated permission checks ---
 async def has_federated_mod_role(interaction: discord.Interaction, config: dict) -> bool:
     """Checks if the user has a whitelisted moderator role for the current guild."""
     federated_guild_ids = config.get("federated_guild_ids", [])
