@@ -132,7 +132,7 @@ class ScreeningView(discord.ui.View):
             # User has been banned from the server
             self.ban_button.disabled = True
             self.kick_button.disabled = True # Can't kick a banned user
-            self.ignore_button.disabled = False # Can still dismiss the alert
+            self.ignore_button.disabled = True
             self.unban_button.disabled = False
         elif state == 'kicked':
             # User has been kicked, a final action for this alert
