@@ -73,6 +73,16 @@ async def save_keywords(keywords_data: dict):
         with open(KEYWORDS_FILE, 'w', encoding='utf-8') as f:
             json.dump(keywords_data, f, indent=4)
 
+def get_delete_days_for_guild(guild: discord.Guild) -> int:
+    """Gets the configured message deletion days for a specific guild."""
+    config = bot.config
+    per_guild_settings = config.get("delete_messages_on_ban_days_per_guild", {})
+    guild_id_str = str(guild.id)
+    if guild_id_str in per_guild_settings:
+        return per_guild_settings[guild_id_str]
+    
+    return config.get("delete_messages_on_ban_days_default", 1)
+
 def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list:
     """
     Checks a given string against a specific ruleset (e.g., username rules or bio rules).
@@ -141,7 +151,11 @@ class ScreeningView(discord.ui.View):
             self.ignore_button.disabled = True
             self.unban_button.disabled = True
 
-    async def get_member(self, interaction: discord.Interaction) -> Optional[discord.Member]:
+    async def get_user_and_member(self, interaction: discord.Interaction) -> tuple[Optional[discord.User], Optional[discord.Member]]:
+        """
+        Fetches the User object and, if possible, the Member object.
+        The User object is almost always available, while the Member is only if they are in the server.
+        """
         if not self.flagged_member_id:
             try:
                 embed_footer = interaction.message.embeds[0].footer.text
@@ -150,20 +164,23 @@ class ScreeningView(discord.ui.View):
                     self.flagged_member_id = int(match.group(1))
                 else:
                     await interaction.followup.send("❌ Could not find user ID in the alert footer.", ephemeral=True)
-                    return None
+                    return None, None
             except (IndexError, TypeError, ValueError, AttributeError):
                 await interaction.followup.send("❌ Could not parse user ID from the alert.", ephemeral=True)
-                return None
-        try:
-            return await interaction.guild.fetch_member(self.flagged_member_id)
-        except discord.NotFound:
-            await interaction.followup.send("❌ User not found. They may have left.", ephemeral=True)
-            return None
-        except Exception as e:
-            logger.error(f"Failed to fetch member {self.flagged_member_id}: {e}", exc_info=True)
-            await interaction.followup.send("❌ Error fetching user data.", ephemeral=True)
-            return None
+                return None, None
 
+        user = bot.get_user(self.flagged_member_id)
+        if not user:
+            try:
+                user = await bot.fetch_user(self.flagged_member_id)
+            except discord.NotFound:
+                await interaction.followup.send("❌ User ID is invalid or the user account was deleted.", ephemeral=True)
+                return None, None
+        
+        member = interaction.guild.get_member(self.flagged_member_id)
+        
+        return user, member
+                
     async def update_embed(self, interaction: discord.Interaction, status: str, color: discord.Color):
         embed = interaction.message.embeds[0]
         embed.color = color
@@ -176,22 +193,44 @@ class ScreeningView(discord.ui.View):
     @discord.ui.button(label="Ban", style=discord.ButtonStyle.red, custom_id="screening_ban")
     async def ban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        member = await self.get_member(interaction)
-        if not member: return
+        result = await self.get_user_and_member(interaction)
+        if result == (None, None):
+            return
+        user, member = result
+
         try:
             reason_text = (f"[Federated Action] AlertID:{interaction.message.id}")
-            await member.ban(reason=reason_text)
+            delete_days = get_delete_days_for_guild(interaction.guild)
+            delete_seconds = delete_days * 86400 # 24 hours * 60 minutes * 60 seconds
+            
+            await interaction.guild.ban(user, reason=reason_text, delete_message_seconds=delete_seconds)
+            
             self.update_buttons_for_state('banned')
-            await self.update_embed(interaction, "✅ Banned", discord.Color.red())
+            
+            status_text = "✅ Banned"
+            if not member:
+                status_text += " (User had left)"
+                
+            await self.update_embed(interaction, status_text, discord.Color.red())
         except Exception as e:
-            logger.error(f"Failed to ban member {self.flagged_member_id}: {e}", exc_info=True)
+            logger.error(f"Failed to ban user {self.flagged_member_id}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ Error banning: {e}", ephemeral=True)
 
     @discord.ui.button(label="Kick", style=discord.ButtonStyle.primary, custom_id="screening_kick")
     async def kick_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        member = await self.get_member(interaction)
-        if not member: return
+        result = await self.get_user_and_member(interaction)
+        if result == (None, None):
+            return
+        _, member = result
+        
+        if not member:
+            await self.update_embed(interaction, "❌ Kick Failed (User left)", discord.Color.greyple())
+            self.kick_button.disabled = True
+            await interaction.followup.edit_message(message_id=interaction.message.id, view=self)
+            await interaction.followup.send("❌ Cannot kick a user who is not in the server.", ephemeral=True)
+            return
+
         try:
             reason_text = "Kicked by Moderator via screening alert."
             await member.kick(reason=reason_text)
@@ -217,13 +256,18 @@ class ScreeningView(discord.ui.View):
     @discord.ui.button(label="Ignore", style=discord.ButtonStyle.grey, custom_id="screening_ignore")
     async def ignore_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        member = await self.get_member(interaction)
+        result = await self.get_user_and_member(interaction)
+        if result == (None, None):
+            return
+        _, member = result
+        
         if member:
             try:
                 await member.timeout(None, reason="Flag marked as safe by Moderator.")
                 logger.info(f"Removed timeout for {member.name} after ignore.")
             except Exception as e:
                 logger.warning(f"Could not remove timeout for {member.name} on ignore: {e}")
+        
         try:
             await interaction.message.delete()
             await interaction.followup.send("✅ Alert dismissed.", ephemeral=True)
@@ -302,6 +346,19 @@ def is_bot_owner():
             return True
         return False
     return discord.app_commands.check(predicate)
+
+async def has_federated_mod_role(interaction: discord.Interaction, config: dict) -> bool:
+    """Checks if the user has a whitelisted moderator role for the current guild."""
+    federated_guild_ids = config.get("federated_guild_ids", [])
+    if interaction.guild.id not in federated_guild_ids:
+        await interaction.response.send_message("❌ This command can only be used in a federated server.", ephemeral=True)
+        return False
+    whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(interaction.guild.id), [])
+    user_role_ids = {role.id for role in interaction.user.roles}
+    if not any(role_id in whitelisted_mod_roles for role_id in user_role_ids):
+        await interaction.response.send_message("❌ You do not have the required role to use this command.", ephemeral=True)
+        return False
+    return True
 
 # --- CORE EVENT LISTENERS ---
 @bot.event
@@ -497,6 +554,8 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
         default_reason = config.get("manual_ban_default_reason", "Scam")
         display_reason = ban_reason if ban_reason != "No reason provided." else default_reason
         detailed_reason_field = {"name": "Ban Reason", "value": f"```{display_reason[:1000]}```"}
+    else:
+        display_reason = detailed_reason_field["value"].strip("`")
 
     if "global" not in stats: stats["global"] = {}
     stats["global"]["total_federated_actions_lifetime"] = stats["global"].get("total_federated_actions_lifetime", 0) + 1
@@ -509,6 +568,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
         await log_channel.send(embed=embed)
         
     logger.info(f"INITIATING FEDERATED BAN for {user} from origin {guild.name}.")
+    
     if authorization_method == "Manual Ban by a whitelisted Moderator":
         origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(guild.id))
         if origin_mod_channel_id:
@@ -523,7 +583,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
             if origin_mod_channel:
                 embed_desc = (
                     f"The manual ban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.\n\n"
-                    f"**Reason:**\n```{ban_reason[:1000]}```"
+                    f"**Reason:**\n```{display_reason[:1000]}```"
                 )
                 origin_alert_embed = discord.Embed(
                     title="✅ Manual Ban Propagated", 
@@ -549,7 +609,11 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
         except discord.NotFound:
             try:
                 fed_reason = f"Federated ban from {guild.name}. Reason: {ban_reason}"
-                await target_guild.ban(user, reason=fed_reason[:512])
+
+                delete_days = get_delete_days_for_guild(target_guild)
+                delete_seconds = delete_days * 86400 # 24h * 60m * 60s
+
+                await target_guild.ban(user, reason=fed_reason[:512], delete_message_seconds=delete_seconds)
                 logger.info(f"SUCCESS: Banned {user} from {target_guild.name}.")
                 if log_channel: await log_channel.send(f"✅ Banned `{user}` in `{target_guild.name}`.")
                 
@@ -957,7 +1021,8 @@ async def reloadconfig(interaction: discord.Interaction):
         await save_keywords(keywords_data)
 
     await interaction.followup.send(
-        f"✅ **Configuration reloaded successfully.**\n"
+        f"✅ **Configuration cache reloaded successfully.**\n"
+        f"The bot is now operating with the latest settings from `config.json`.\n"
         f"Now managing **{len(federated_guild_ids)}** federated servers.\n"
         f"{'Keyword file was updated with new server entries.' if updated else 'No new servers found to add.'}"
     )
@@ -1408,18 +1473,50 @@ async def stopscan(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ℹ️ No scan is currently in progress.", ephemeral=True)
 
-async def has_federated_mod_role(interaction: discord.Interaction, config: dict) -> bool:
-    """Checks if the user has a whitelisted moderator role for the current guild."""
-    federated_guild_ids = config.get("federated_guild_ids", [])
-    if interaction.guild.id not in federated_guild_ids:
-        await interaction.response.send_message("❌ This command can only be used in a federated server.", ephemeral=True)
-        return False
-    whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(interaction.guild.id), [])
-    user_role_ids = {role.id for role in interaction.user.roles}
-    if not any(role_id in whitelisted_mod_roles for role_id in user_role_ids):
-        await interaction.response.send_message("❌ You do not have the required role to use this command.", ephemeral=True)
-        return False
-    return True
+@bot.tree.command(name="contact-maintainer", description="Send a message to the bot maintainer. For requests, feedback, or issues.")
+@discord.app_commands.describe(message="Your message, feedback, or request for the bot maintainer.")
+async def contact_maintainer(interaction: discord.Interaction, message: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config):
+        return
+
+    log_channel_id = config.get("log_channel_id")
+    if not log_channel_id:
+        await interaction.response.send_message("❌ The bot's log channel is not configured. Please contact the owner directly.", ephemeral=True)
+        return
+
+    log_channel = bot.get_channel(log_channel_id)
+    if not log_channel:
+        try:
+            log_channel = await bot.fetch_channel(log_channel_id)
+        except (discord.NotFound, discord.Forbidden):
+            await interaction.response.send_message("❌ Could not find or access the bot's log channel. Please contact the owner directly.", ephemeral=True)
+            logger.error(f"Could not fetch log channel {log_channel_id} for contact-admin command.")
+            return
+
+    bot_owner_id = config.get("bot_owner_id")
+    if not bot_owner_id:
+        await interaction.response.send_message("❌ The bot owner's ID is not configured. Cannot send notification.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📬 Contact Request",
+        description=f"A new message has been sent by a moderator.",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="📝 Message", value=f"```{message[:1000]}```", inline=False)
+    embed.add_field(name="👤 Sender", value=f"{interaction.user.name} (`{interaction.user.id}`)", inline=True)
+    embed.add_field(name="🌐 Server", value=interaction.guild.name, inline=True)
+    embed.set_footer(text="This is a direct request from a federated moderator.")
+
+    try:
+        await log_channel.send(content=f"<@{bot_owner_id}>", embed=embed)
+        await interaction.response.send_message("✅ Your message has been successfully sent to the bot maintainer.", ephemeral=True)
+        logger.info(f"Moderator {interaction.user.name} from {interaction.guild.name} sent an admin contact request.")
+    except Exception as e:
+        await interaction.response.send_message("❌ An error occurred while trying to send your message. Please try again later.", ephemeral=True)
+        logger.error(f"Failed to send contact message to log channel: {e}", exc_info=True)
 
 # --- MAIN ---
 if __name__ == "__main__":
