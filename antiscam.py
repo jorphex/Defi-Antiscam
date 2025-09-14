@@ -294,6 +294,17 @@ class AntiScamBot(discord.Client):
         await self.tree.sync()
 bot = AntiScamBot(intents=intents)
 
+def is_bot_owner():
+    """A check decorator to ensure the user is the bot's owner."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        # The bot instance is available via interaction.client
+        app_info = await interaction.client.application_info()
+        if interaction.user.id == app_info.owner.id:
+            return True
+        # Optionally, you can send a message if the check fails, but the library handles it.
+        # await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
+        return False
+    return discord.app_commands.check(predicate)
 
 # --- CORE EVENT LISTENERS ---
 @bot.event
@@ -776,11 +787,8 @@ async def run_full_scan(interaction: discord.Interaction):
 
 # --- OWNER SLASH COMMANDS ---
 @bot.tree.command(name="zreloadconfig", description="[Owner Only] Reloads federation config and updates keyword file.")
+@is_bot_owner()
 async def reloadconfig(interaction: discord.Interaction):
-    if not await bot.is_owner(interaction.user):
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
-        return
-
     await interaction.response.defer(ephemeral=True)
     logger.info(f"OWNER COMMAND: {interaction.user.name} triggered a configuration reload.")
     
@@ -875,66 +883,58 @@ async def remove_global_keyword_from_list(interaction: discord.Interaction, keyw
 # --- OWNER GLOBAL KEYWORD COMMANDS ---
 @bot.tree.command(name="zadd-global-name-substring", description="[Owner Only] Adds a SUBSTRING keyword to the GLOBAL list.")
 @discord.app_commands.describe(keyword="The keyword to add globally (e.g., 'admin').")
+@is_bot_owner()
 async def add_global_username_substring(interaction: discord.Interaction, keyword: str):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await add_global_keyword_to_list(interaction, keyword, "username_keywords", "substring")
 
 @bot.tree.command(name="zadd-global-name-smart", description="[Owner Only] Adds a SMART keyword to the GLOBAL list.")
 @discord.app_commands.describe(keyword="The keyword to add globally (e.g., 'mod').")
+@is_bot_owner()
 async def add_global_username_smart(interaction: discord.Interaction, keyword: str):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await add_global_keyword_to_list(interaction, keyword, "username_keywords", "smart")
 
 @bot.tree.command(name="zadd-global-bio-keyword", description="[Owner Only] Adds a BIO keyword to the GLOBAL list.")
 @discord.app_commands.describe(keyword="The keyword or phrase to add globally.")
+@is_bot_owner()
 async def add_global_bio_keyword(interaction: discord.Interaction, keyword: str):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await add_global_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
 
 # --- OWNER GLOBAL REGEX COMMANDS ---
 @bot.tree.command(name="zadd-global-regex", description="[OWNER ONLY] Adds a regex pattern to the GLOBAL list.")
 @discord.app_commands.describe(pattern="The exact regex pattern to add globally.")
+@is_bot_owner()
 async def add_global_regex(interaction: discord.Interaction, pattern: str):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await add_regex_to_list(interaction, pattern, is_global=True)
 
 @bot.tree.command(name="zrm-global-name-substring", description="[Owner Only] Removes a SUBSTRING keyword from the GLOBAL list.")
 @discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+@is_bot_owner()
 async def remove_global_username_substring(interaction: discord.Interaction, keyword: str):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "substring")
 
 @bot.tree.command(name="zrm-global-name-smart", description="[Owner Only] Removes a SMART keyword from the GLOBAL list.")
 @discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+@is_bot_owner()
 async def remove_global_username_smart(interaction: discord.Interaction, keyword: str):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "smart")
 
 @bot.tree.command(name="zrm-global-bio-keyword", description="[Owner Only] Removes a BIO keyword from the GLOBAL list.")
 @discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+@is_bot_owner()
 async def remove_global_bio_keyword(interaction: discord.Interaction, keyword: str):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await remove_global_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
 
 @bot.tree.command(name="zrm-global-regex-by-id", description="[OWNER ONLY] Removes a regex from the GLOBAL list by its ID.")
 @discord.app_commands.describe(index="The numerical ID of the global regex pattern to remove.")
+@is_bot_owner()
 async def remove_global_regex_by_id(interaction: discord.Interaction, index: int):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ This command is restricted to the bot owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await remove_regex_from_list_by_id(interaction, index, is_global=True)
 
