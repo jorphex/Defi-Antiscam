@@ -199,9 +199,30 @@ class ScreeningView(discord.ui.View):
         user, member = result
 
         try:
-            reason_text = (f"[Federated Action] AlertID:{interaction.message.id}")
+            original_embed = interaction.message.embeds[0]
+            descriptive_reason = "Reason not parsed from alert." # Fallback
+
+            if "User Banned Elsewhere" in original_embed.title:
+                for field in original_embed.fields:
+                    if "Banned In" in field.name:
+                        descriptive_reason = f"User already banned in {field.name.split(': ')[1]}."
+                        break
+            elif "Flagged User" in original_embed.title:
+                for field in original_embed.fields:
+                    if "Trigger" in field.name:
+                        descriptive_reason = f"Flagged by keyword screening. Trigger: {field.value.strip('`')}."
+                        break
+            elif "Flagged Message" in original_embed.title:
+                for field in original_embed.fields:
+                    if "Trigger" in field.name:
+                        descriptive_reason = f"Flagged for a message. Trigger: {field.value.strip('`')}."
+                        break
+            
+            # Combine the descriptive reason with the AlertID for traceability
+            reason_text = f"[Federated Action] {descriptive_reason} | AlertID:{interaction.message.id}"
+            
             delete_days = get_delete_days_for_guild(interaction.guild)
-            delete_seconds = delete_days * 86400 # 24 hours * 60 minutes * 60 seconds
+            delete_seconds = delete_days * 86400
             
             await interaction.guild.ban(user, reason=reason_text, delete_message_seconds=delete_seconds)
             
@@ -950,7 +971,7 @@ async def run_full_scan(interaction: discord.Interaction):
             whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(guild.id), [])
             if any(role.id in whitelisted_roles for role in member.roles):
                 continue
-            result = await screen_member(member, config)
+            result = await screen_member(member, config, keywords_data)
             
             if result.get("flagged"):
                 flagged_count += 1
