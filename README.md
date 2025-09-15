@@ -28,7 +28,7 @@ Inspired by [danijelthales](https://github.com/danijelthales) antiscam bot.
 📊 Federation Statistics  
   Track how many bans your server has initiated and received, and the federation total, giving you a clear view of the federation's impact.
 
-Find me on [Yearn Discord](https://discord.gg/yearn) or [X](https://x.com/JxyHelper) to join the federation. You gain the collective experience of all trusted member communities, reducing moderator workload and stopping threats before they can act.
+Find me on [Yearn Discord](https://discord.gg/yearn) or [X](https://x.com/JxyHelper) to join the federation. You gain the collective experience of trusted member communities, reducing moderator workload and stopping threats before they can act.
 
 ## Current Servers
 - Yearn
