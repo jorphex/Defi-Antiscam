@@ -516,30 +516,44 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
         if alert_id_match:
             is_authorized, authorization_method = True, "Authorized via Bot Alert"
             alert_message_id = int(alert_id_match.group(1))
-            
-            origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(guild.id))
-            if origin_mod_channel_id:
+            alert_message = None
+            guild_id_str = str(guild.id)
+
+            # Try the primary mod alert channel first
+            primary_channel_id = config.get("mod_alert_channels", {}).get(guild_id_str)
+            if primary_channel_id:
                 try:
-                    origin_mod_channel = bot.get_channel(origin_mod_channel_id)
-                    if not origin_mod_channel:
-                        origin_mod_channel = await bot.fetch_channel(origin_mod_channel_id)
-                    
-                    alert_message = await origin_mod_channel.fetch_message(alert_message_id)
-                    if alert_message.embeds:
-                        original_embed = alert_message.embeds[0]
-                        # Extract the most useful field (flagged message, bio, or trigger)
-                        for field in original_embed.fields:
-                            if "Message" in field.name or "Bio" in field.name:
-                                detailed_reason_field = {"name": f"Original {field.name}", "value": field.value}
-                                break
-                        # Fallback to trigger keywords if no content field is found
-                        if not detailed_reason_field:
-                             for field in original_embed.fields:
-                                if "Trigger" in field.name:
-                                    detailed_reason_field = {"name": "Original Trigger", "value": field.value}
-                                    break
-                except (discord.NotFound, discord.Forbidden) as e:
-                    logger.warning(f"Could not fetch original alert message {alert_message_id} in origin guild {guild.name}: {e}")
+                    channel = bot.get_channel(primary_channel_id) or await bot.fetch_channel(primary_channel_id)
+                    alert_message = await channel.fetch_message(alert_message_id)
+                except (discord.NotFound, discord.Forbidden):
+                    alert_message = None # Not found here, will try next channel
+
+            # If not found, try the scan results channel
+            if not alert_message:
+                scan_channel_id = config.get("mod_scan_results_channels", {}).get(guild_id_str)
+                # Ensure we don't check the same channel twice
+                if scan_channel_id and scan_channel_id != primary_channel_id:
+                    try:
+                        channel = bot.get_channel(scan_channel_id) or await bot.fetch_channel(scan_channel_id)
+                        alert_message = await channel.fetch_message(alert_message_id)
+                    except (discord.NotFound, discord.Forbidden):
+                        alert_message = None # Not found here either
+                        
+            # Process the message if it was found in either channel
+            if alert_message and alert_message.embeds:
+                original_embed = alert_message.embeds[0]
+                for field in original_embed.fields:
+                    if "Message" in field.name or "Bio" in field.name or "Banned In" in field.name:
+                        detailed_reason_field = {"name": f"Original {field.name}", "value": field.value}
+                        break
+                if not detailed_reason_field:
+                     for field in original_embed.fields:
+                        if "Trigger" in field.name:
+                            detailed_reason_field = {"name": "Original Trigger", "value": field.value}
+                            break
+
+            else:
+                logger.warning(f"Could not fetch original alert message {alert_message_id} in any configured channel for guild {guild.name}.")
         else:
             # This is a federated ban echo, not a new action.
             logger.info(f"Ignoring federated ban echo for {user} in {guild.name}.")
@@ -737,7 +751,6 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
         logger.warning(f"Unban of {user} by {moderator} did not pass authorization checks.")
         return
 
-    # Load stats once after authorization is confirmed.
     stats = await load_fed_stats()
     current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
 
