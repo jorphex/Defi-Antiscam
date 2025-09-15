@@ -342,6 +342,40 @@ class ConfirmScanView(discord.ui.View):
         for item in self.children: item.disabled = True
         await interaction.response.edit_message(content="Scan cancelled.", view=self)
 
+class RegexTestModal(discord.ui.Modal, title="Regex Test"):
+    def __init__(self, pattern: str, compiled_regex: re.Pattern):
+        super().__init__()
+        self.pattern = pattern
+        self.compiled_regex = compiled_regex
+
+    sample_text = discord.ui.TextInput(
+        label="Sample Text",
+        style=discord.TextStyle.paragraph,
+        placeholder="Paste the raw, multi-line sample text here...",
+        required=True,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text_to_test = self.sample_text.value
+        match = self.compiled_regex.search(text_to_test)
+
+        if match:
+            embed = discord.Embed(title="✅ Regex Test: Match Found", color=discord.Color.green())
+            embed.add_field(name="Pattern", value=f"`{self.pattern}`", inline=False)
+            embed.add_field(name="Sample Text", value=f"```{text_to_test}```", inline=False)
+            embed.add_field(name="Matched Text", value=f"`{match.group(0)}`", inline=False)
+        else:
+            embed = discord.Embed(title="❌ Regex Test: No Match", color=discord.Color.orange())
+            embed.add_field(name="Pattern", value=f"`{self.pattern}`", inline=False)
+            embed.add_field(name="Sample Text", value=f"```{text_to_test}```", inline=False)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        logger.error(f"Error in RegexTestModal: {error}", exc_info=True)
+        await interaction.response.send_message("An unexpected error occurred. Please check the logs.", ephemeral=True)
+
 # --- BOT SETUP ---
 intents = discord.Intents.default()
 intents.guilds = True
@@ -519,7 +553,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
             alert_message = None
             guild_id_str = str(guild.id)
 
-            # Try the primary mod alert channel first
+            # 1. Try the primary mod alert channel first
             primary_channel_id = config.get("mod_alert_channels", {}).get(guild_id_str)
             if primary_channel_id:
                 try:
@@ -528,7 +562,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                 except (discord.NotFound, discord.Forbidden):
                     alert_message = None # Not found here, will try next channel
 
-            # If not found, try the scan results channel
+            # 2. If not found, try the scan results channel as a fallback
             if not alert_message:
                 scan_channel_id = config.get("mod_scan_results_channels", {}).get(guild_id_str)
                 # Ensure we don't check the same channel twice
@@ -539,9 +573,10 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                     except (discord.NotFound, discord.Forbidden):
                         alert_message = None # Not found here either
                         
-            # Process the message if it was found in either channel
+            # 3. Now, process the message if it was found in either channel
             if alert_message and alert_message.embeds:
                 original_embed = alert_message.embeds[0]
+                # ... (context extraction logic is unchanged) ...
                 for field in original_embed.fields:
                     if "Message" in field.name or "Bio" in field.name or "Banned In" in field.name:
                         detailed_reason_field = {"name": f"Original {field.name}", "value": field.value}
@@ -553,6 +588,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                             break
 
             else:
+                # This warning is now much more meaningful, as it means the alert was not found in ANY configured channel.
                 logger.warning(f"Could not fetch original alert message {alert_message_id} in any configured channel for guild {guild.name}.")
         else:
             # This is a federated ban echo, not a new action.
@@ -751,6 +787,7 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
         logger.warning(f"Unban of {user} by {moderator} did not pass authorization checks.")
         return
 
+    # Load stats once after authorization is confirmed.
     stats = await load_fed_stats()
     current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
 
@@ -1134,7 +1171,7 @@ async def add_global_username_smart(interaction: discord.Interaction, keyword: s
     await interaction.response.defer(ephemeral=True)
     await add_global_keyword_to_list(interaction, keyword, "username_keywords", "smart")
 
-@bot.tree.command(name="zadd-global-bio-keyword", description="[Owner Only] Adds a BIO keyword to the GLOBAL list.")
+@bot.tree.command(name="zadd-global-bio-msg-keyword", description="[Owner Only] Adds a BIO keyword to the GLOBAL list.")
 @discord.app_commands.describe(keyword="The keyword or phrase to add globally.")
 @is_bot_owner()
 async def add_global_bio_keyword(interaction: discord.Interaction, keyword: str):
@@ -1163,7 +1200,7 @@ async def remove_global_username_smart(interaction: discord.Interaction, keyword
     await interaction.response.defer(ephemeral=True)
     await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "smart")
 
-@bot.tree.command(name="zrm-global-bio-keyword", description="[Owner Only] Removes a BIO keyword from the GLOBAL list.")
+@bot.tree.command(name="zrm-global-bio-msg-keyword", description="[Owner Only] Removes a BIO keyword from the GLOBAL list.")
 @discord.app_commands.describe(keyword="The exact keyword to remove globally.")
 @is_bot_owner()
 async def remove_global_bio_keyword(interaction: discord.Interaction, keyword: str):
@@ -1178,8 +1215,8 @@ async def remove_global_regex_by_id(interaction: discord.Interaction, index: int
     await remove_regex_from_list_by_id(interaction, index, is_global=True)
 
 # --- MODERATOR SLASH COMMANDS ---
-@bot.tree.command(name="bancounter", description="Displays local and federated ban statistics.")
-async def bancounter(interaction: discord.Interaction):
+@bot.tree.command(name="stats", description="Displays local and federated ban statistics.")
+async def stats(interaction: discord.Interaction):
     config = bot.config
     if not await has_federated_mod_role(interaction, config): return
     await interaction.response.defer()
@@ -1312,7 +1349,7 @@ async def add_username_keyword_smart(interaction: discord.Interaction, keyword: 
     await interaction.response.defer(ephemeral=True)
     await add_keyword_to_list(interaction, keyword, "username_keywords", "smart")
 
-@bot.tree.command(name="add-bio-keyword", description="Keyword for screening user bios and messages.")
+@bot.tree.command(name="add-bio-msg-keyword", description="Keyword for screening user bios and messages.")
 @discord.app_commands.describe(keyword="The keyword or phrase to add (e.g., 'dm me for help').")
 async def add_bio_keyword(interaction: discord.Interaction, keyword: str):
     config = bot.config
@@ -1359,33 +1396,27 @@ async def add_regex_to_list(interaction: discord.Interaction, pattern: str, is_g
 
 
 
-@bot.tree.command(name="test-regex", description="Tests a regex pattern against sample text without saving it.")
-@discord.app_commands.describe(pattern="The regex pattern to test.", sample_text="The text to test the pattern against.")
-async def test_regex(interaction: discord.Interaction, pattern: str, sample_text: str):
+@bot.tree.command(name="test-regex", description="Tests a regex pattern against sample text using a pop-up form.")
+@discord.app_commands.describe(
+    pattern="The regex pattern to test. Remember to escape special characters (e.g., '\\.')."
+)
+async def test_regex(interaction: discord.Interaction, pattern: str):
     config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    
-    try:
-        re.compile(pattern)
-        match = re.search(pattern, sample_text, re.IGNORECASE)
-        
-        if match:
-            embed = discord.Embed(title="✅ Regex Test: Match Found", color=discord.Color.green())
-            embed.add_field(name="Pattern", value=f"`{pattern}`", inline=False)
-            embed.add_field(name="Sample Text", value=f"```{sample_text}```", inline=False)
-            embed.add_field(name="Matched Text", value=f"`{match.group(0)}`", inline=False)
-        else:
-            embed = discord.Embed(title="❌ Regex Test: No Match", color=discord.Color.orange())
-            embed.add_field(name="Pattern", value=f"`{pattern}`", inline=False)
-            embed.add_field(name="Sample Text", value=f"```{sample_text}```", inline=False)
-            
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    if not await has_federated_mod_role(interaction, config):
+        return
 
+    # Validate regex
+    try:
+        compiled_regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
         await interaction.response.send_message(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`", ephemeral=True)
+        return
+
+    modal = RegexTestModal(pattern=pattern, compiled_regex=compiled_regex)
+    await interaction.response.send_modal(modal)
 
 @bot.tree.command(name="add-regex", description="Adds a regex pattern to this server's local list. Try /test-regex first!")
-@discord.app_commands.describe(pattern="The exact regex pattern to add. Must be double-escaped for backslashes.")
+@discord.app_commands.describe(pattern="The exact regex pattern to add. Escape special characters with a backslash (e.g., '\\.').")
 async def add_local_regex(interaction: discord.Interaction, pattern: str):
     config = bot.config
     if not await has_federated_mod_role(interaction, config): return
@@ -1441,7 +1472,7 @@ async def remove_username_keyword_smart(interaction: discord.Interaction, keywor
     await interaction.response.defer(ephemeral=True)
     await remove_keyword_from_list(interaction, keyword, "username_keywords", "smart")
 
-@bot.tree.command(name="rm-bio-keyword", description="Removes a keyword from this server's local bio/message list.")
+@bot.tree.command(name="rm-bio-msg-keyword", description="Removes a keyword from this server's local bio/message list.")
 @discord.app_commands.describe(keyword="The exact keyword or phrase to remove.")
 async def remove_bio_keyword(interaction: discord.Interaction, keyword: str):
     config = bot.config
@@ -1507,7 +1538,7 @@ async def stopscan(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ℹ️ No scan is currently in progress.", ephemeral=True)
 
-@bot.tree.command(name="contact-maintainer", description="Send a message to the bot maintainer. For requests, feedback, or issues.")
+@bot.tree.command(name="contact-maintainer", description="Send a message to the bot maintainer for requests, feedback, or issues.")
 @discord.app_commands.describe(message="Your message, feedback, or request for the bot maintainer.")
 async def contact_maintainer(interaction: discord.Interaction, message: str):
     config = bot.config
