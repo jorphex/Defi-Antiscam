@@ -11,7 +11,7 @@ Inspired by [danijelthales](https://github.com/danijelthales) antiscam bot.
   The bot monitors chat for scam links, malicious phrases, and advanced obfuscation. It instantly deletes matched messages and puts the user in timeout.
 
 🔎 Rich Context on Federated Actions  
-  The original flagged message, bio, or keywords that triggered the ban in a server are included in federated ban notice messages in the other server allowing your team to make informed decisions.
+  The original flagged message, bio, or keywords that triggered the ban in a server are included in federated ban notice messages in the other servers allowing your team to make informed decisions.
 
 ℹ️ Interactive Alerts  
   Alert messages are sent to your specified private channel with buttons to Ban, Kick, Unban, or Ignore (removes timeout). The UI allows for quick reversals if a mistake is made.
