@@ -229,7 +229,6 @@ class ScreeningView(discord.ui.View):
                         descriptive_reason = f"Flagged for a message. Trigger: {field.value.strip('`')}."
                         break
             
-            # Combine the descriptive reason with the AlertID for traceability
             reason_text = f"[Federated Action] {descriptive_reason} | AlertID:{interaction.message.id}"
             
             delete_days = get_delete_days_for_guild(interaction.guild)
@@ -350,6 +349,21 @@ class ConfirmGlobalBanView(discord.ui.View):
         await interaction.response.edit_message(content="✅ **Confirmation received. Propagating global ban...**", embed=None, view=self)
 
         try:
+            config = bot.config
+            origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(interaction.guild.id))
+            if origin_mod_channel_id:
+                origin_mod_channel = bot.get_channel(origin_mod_channel_id) or await bot.fetch_channel(origin_mod_channel_id)
+                if origin_mod_channel:
+                    confirm_embed = discord.Embed(
+                        title="✅ Proactive Global Ban Initiated",
+                        description=f"Ban was initiated from this server and has been broadcast to all federated servers.",
+                        color=discord.Color.blue(),
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    confirm_embed.set_author(name=f"{self.user_to_ban.name} (`{self.user_to_ban.id}`)", icon_url=self.user_to_ban.display_avatar.url)
+                    confirm_embed.add_field(name="Reason", value=f"```{self.reason}```", inline=False)
+                    await origin_mod_channel.send(embed=confirm_embed)
+
             await propagate_ban(
                 origin_guild=interaction.guild,
                 user_to_ban=self.user_to_ban,
@@ -547,27 +561,22 @@ async def on_message(message: discord.Message):
         author_id = message.author.id
         current_time = datetime.now(timezone.utc)
         
-        # Check if the user is in the cache and was checked recently (e.g., within 5 minutes)
         if author_id in bio_check_cache:
             last_checked = bio_check_cache[author_id]
             if (current_time - last_checked).total_seconds() < 300: # 300 seconds = 5 minutes
                 return # Already checked recently, do nothing.
 
-        # User not in cache or cache is stale, so we perform the check.
         bio_result = await screen_bio(message.author, config, keywords_data)
         
-        # Update the cache with the current timestamp regardless of the result.
         bio_check_cache[author_id] = current_time
 
-        # If the bio was flagged, we use its result.
         if bio_result.get("flagged"):
-            # Fix the embed description to include the channel context
             embed = bio_result.get("embed")
             embed.description = (
                 f"**User:** {message.author.mention} (`{message.author.id}`)\n"
                 f"This user sent a valid message in {message.channel.mention}, but their bio was flagged upon inspection."
             )
-            result = bio_result # Overwrite the clean result with the flagged bio result
+            result = bio_result
 
     if result.get("flagged"):
         author = message.author
@@ -581,7 +590,13 @@ async def on_message(message: discord.Message):
         try:
             timeout_minutes = get_timeout_minutes_for_guild(author.guild)
             await author.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason", "Flagged content."))
-        except Exception as e: logger.error(f"Failed to timeout {author.name}: {e}")
+        except discord.HTTPException as e:
+            if e.code == 40007: # User is not a member of this guild
+                logger.warning(f"Could not timeout {author.name} because they have already left the server.")
+            else:
+                logger.error(f"Failed to timeout {author.name}: {e}")
+        except Exception as e:
+             logger.error(f"An unexpected error occurred while trying to timeout {author.name}: {e}")
         
         mod_channel_id = config.get("mod_alert_channels", {}).get(str(message.guild.id))
         alert_channel = message.guild.get_channel(mod_channel_id) if mod_channel_id else None
@@ -638,7 +653,6 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
             alert_message = None
             guild_id_str = str(guild.id)
 
-            # 1. Try the primary mod alert channel first
             primary_channel_id = config.get("mod_alert_channels", {}).get(guild_id_str)
             if primary_channel_id:
                 try:
@@ -647,10 +661,8 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                 except (discord.NotFound, discord.Forbidden):
                     alert_message = None # Not found here, will try next channel
 
-            # 2. If not found, try the scan results channel as a fallback
             if not alert_message:
                 scan_channel_id = config.get("mod_scan_results_channels", {}).get(guild_id_str)
-                # Ensure we don't check the same channel twice
                 if scan_channel_id and scan_channel_id != primary_channel_id:
                     try:
                         channel = bot.get_channel(scan_channel_id) or await bot.fetch_channel(scan_channel_id)
@@ -658,10 +670,8 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                     except (discord.NotFound, discord.Forbidden):
                         alert_message = None # Not found here either
                         
-            # 3. Now, process the message if it was found in either channel
             if alert_message and alert_message.embeds:
                 original_embed = alert_message.embeds[0]
-                # ... (context extraction logic is unchanged) ...
                 for field in original_embed.fields:
                     if "Message" in field.name or "Bio" in field.name or "Banned In" in field.name:
                         detailed_reason_field = {"name": f"Original {field.name}", "value": field.value}
@@ -673,12 +683,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                             break
 
             else:
-                # This warning is now much more meaningful, as it means the alert was not found in ANY configured channel.
                 logger.warning(f"Could not fetch original alert message {alert_message_id} in any configured channel for guild {guild.name}.")
-        else:
-            # This is a federated ban echo, not a new action.
-            logger.info(f"Ignoring federated ban echo for {user} in {guild.name}.")
-            return
         
     elif not moderator.bot:
         if isinstance(moderator, discord.Member):
@@ -841,6 +846,24 @@ async def propagate_ban(origin_guild: discord.Guild, user_to_ban: discord.User, 
         target_guild = bot.get_guild(guild_id)
         if not target_guild: continue
         
+        if target_guild.id == origin_guild.id:
+            try:
+                # First, check if the user is already banned.
+                await target_guild.fetch_ban(user_to_ban)
+                logger.info(f"User {user_to_ban.name} was already banned in the origin guild {target_guild.name}.")
+            except discord.NotFound:
+                # If not found, then proceed with the ban.
+                try:
+                    delete_seconds = get_delete_days_for_guild(target_guild) * 86400
+                    await target_guild.ban(user_to_ban, reason=f"Proactive ban initiated by {moderator.name}. Reason: {reason}", delete_message_seconds=delete_seconds)
+                    logger.info(f"Successfully banned user in origin guild {target_guild.name} as part of proactive ban.")
+                except discord.HTTPException as e:
+                    if e.code == 50013: # Missing Permissions
+                        logger.warning(f"Missing 'Ban Members' permission in origin guild {target_guild.name} for proactive ban.")
+                    else:
+                        logger.error(f"Failed to ban user in origin guild during proactive ban: {e}")
+            continue # Always move to the next server after handling the origin.
+
         bot_member = target_guild.me
         if not bot_member.guild_permissions.ban_members:
             logger.warning(f"Missing 'Ban Members' permission in {target_guild.name}. Skipping federated ban.")
@@ -959,11 +982,9 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
         logger.warning(f"Unban of {user} by {moderator} did not pass authorization checks.")
         return
 
-    # Load stats once after authorization is confirmed.
     stats = await load_fed_stats()
     current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
 
-    # The global counter is decremented for any authorized unban (local or global).
     if "global" not in stats: stats["global"] = {}
     stats["global"]["total_federated_actions_lifetime"] = max(0, stats["global"].get("total_federated_actions_lifetime", 0) - 1)
     
@@ -1062,9 +1083,9 @@ async def screen_member(member: discord.Member, config: dict, keywords_data: dic
     Does NOT perform any actions (timeout, send message).
     Returns a dictionary with flag status, embed, and timeout reason.
     """
+    # --- Banned Elsewhere Check ---
     federated_guild_ids = config.get("federated_guild_ids", [])
     found_bans = []
-
     for other_guild_id in federated_guild_ids:
         if other_guild_id == member.guild.id: continue
         other_guild = bot.get_guild(other_guild_id)
@@ -1081,21 +1102,24 @@ async def screen_member(member: discord.Member, config: dict, keywords_data: dic
     if found_bans:
         banned_in_servers = ", ".join([ban['guild_name'] for ban in found_bans])
         timeout_reason = f"Flagged on join: User is banned in partner server(s): {banned_in_servers}."
-
         embed = discord.Embed(title="🚨 User Banned Elsewhere", description=f"**User:** {member.mention} (`{member.id}`)\nThis user is already banned in **{len(found_bans)}** other federated server(s).", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
         embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
         for ban in found_bans:
             embed.add_field(name=f"Banned In: {ban['guild_name']}", value=f"```{ban['reason'][:1000]}```", inline=False)
-        embed.add_field(name="Status", value="User timed out for 1 day. Awaiting review...", inline=True)
-        
+        embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
 
+    # --- Keyword Screening (Name and Bio) ---
+    user_profile = member
+    bio = ""
     try:
-        user_profile = await bot.fetch_user(member.id)
-        bio = getattr(user_profile, 'bio', "")
+        full_profile = await bot.fetch_user(member.id)
+        user_profile = full_profile
+        bio = getattr(full_profile, 'bio', "")
+    except discord.NotFound:
+        logger.warning(f"Could not fetch profile for {member.name} ({member.id}) during screening, user may no longer exist. Proceeding without bio check.")
     except Exception as e:
-        logger.error(f"Error fetching profile for {member.name}: {e}", exc_info=True)
-        bio = ""
+        logger.error(f"Could not fetch profile for {member.name} ({member.id}) to get bio. Proceeding without it. Error: {e}")
 
     triggered_keywords = []
     name_text = f"{user_profile.name} {member.nick or ''}"
@@ -1105,22 +1129,21 @@ async def screen_member(member: discord.Member, config: dict, keywords_data: dic
 
     triggered_keywords.extend(check_text_for_keywords(name_text, local_rules.get("username_keywords", {})))
     triggered_keywords.extend(check_text_for_keywords(name_text, global_rules.get("username_keywords", {})))
-    triggered_keywords.extend(check_text_for_keywords(bio, local_rules.get("bio_and_message_keywords", {})))
-    triggered_keywords.extend(check_text_for_keywords(bio, global_rules.get("bio_and_message_keywords", {})))
+    if bio:
+        triggered_keywords.extend(check_text_for_keywords(bio, local_rules.get("bio_and_message_keywords", {})))
+        triggered_keywords.extend(check_text_for_keywords(bio, global_rules.get("bio_and_message_keywords", {})))
 
     triggered_keywords = list(set(triggered_keywords))
 
     if triggered_keywords:
         timeout_reason = "Flagged by keyword screening."
-        
         embed = discord.Embed(title="🚨 Flagged User", description=f"{member.mention} (`{member.id}`)", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
         embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
         if bio:
             embed.add_field(name="📝 Bio", value=bio[:1024], inline=False)
         embed.add_field(name="🚩 Trigger", value=f"`{', '.join(triggered_keywords)}`", inline=True)
-        embed.add_field(name="Status", value="User timed out for 1 day. Awaiting review...", inline=True)
+        embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
         embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
-        
         return {"flagged": True, "embed": embed, "timeout_reason": "Flagged by keyword screening."}
 
     return {"flagged": False}
@@ -1162,23 +1185,29 @@ async def screen_message(message: discord.Message, config: dict, keywords_data: 
 async def screen_bio(member: discord.Member, config: dict, keywords_data: dict) -> dict:
     """
     Performs the screening process for a member's bio and returns the findings.
+    Optimized to avoid API calls if bio is already cached on the member object.
     """
     if not keywords_data: return {"flagged": False}
 
-    try:
-        user_profile = await bot.fetch_user(member.id)
-        bio = getattr(user_profile, 'bio', "")
-        if not bio: # No bio to check
+    bio = ""
+    if hasattr(member, '_user') and hasattr(member._user, 'bio'):
+        bio = member._user.bio
+    
+    if not bio:
+        try:
+            user_profile = await bot.fetch_user(member.id)
+            bio = getattr(user_profile, 'bio', "")
+        except Exception as e:
+            logger.error(f"Error fetching profile for {member.name} during bio screen: {e}", exc_info=True)
             return {"flagged": False}
-    except Exception as e:
-        logger.error(f"Error fetching profile for {member.name} during bio screen: {e}", exc_info=True)
+
+    if not bio:
         return {"flagged": False}
 
     triggered_keywords = []
     local_rules = keywords_data.get("per_server_keywords", {}).get(str(member.guild.id), {})
     global_rules = keywords_data.get("global_keywords", {})
 
-    # We only check bio/message keywords for the bio content.
     triggered_keywords.extend(check_text_for_keywords(bio, local_rules.get("bio_and_message_keywords", {})))
     triggered_keywords.extend(check_text_for_keywords(bio, global_rules.get("bio_and_message_keywords", {})))
     triggered_keywords = list(set(triggered_keywords))
@@ -1621,7 +1650,6 @@ async def test_regex(interaction: discord.Interaction, pattern: str):
     if not await has_federated_mod_role(interaction, config):
         return
 
-    # Validate regex
     try:
         compiled_regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
@@ -1809,7 +1837,6 @@ async def global_ban(interaction: discord.Interaction, user_id: str, reason: str
     if not await has_federated_mod_role(interaction, config):
         return
 
-    # --- Input Validation ---
     if not user_id.isdigit():
         await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID (numbers only).", ephemeral=True)
         return
@@ -1824,7 +1851,6 @@ async def global_ban(interaction: discord.Interaction, user_id: str, reason: str
         await interaction.response.send_message("❌ I cannot ban myself.", ephemeral=True)
         return
 
-    # --- Fetch User Object ---
     try:
         user_to_ban = await bot.fetch_user(target_user_id)
     except discord.NotFound:
@@ -1835,8 +1861,6 @@ async def global_ban(interaction: discord.Interaction, user_id: str, reason: str
         logger.error(f"Failed to fetch user for global-ban command: {e}", exc_info=True)
         return
 
-    # --- Confirmation Step ---
-    # This is a destructive action, so we should ask for confirmation.
     confirm_embed = discord.Embed(
         title="⚠️ Confirm Global Ban",
         description=f"You are about to issue a federated ban for the following user. This action cannot be easily undone and will affect **all** federated servers.",
@@ -1847,8 +1871,6 @@ async def global_ban(interaction: discord.Interaction, user_id: str, reason: str
 
     view = ConfirmGlobalBanView(author=interaction.user, user_to_ban=user_to_ban, reason=reason)
     await interaction.response.send_message(embed=confirm_embed, view=view, ephemeral=True)
-
-    # The view will handle the rest of the logic.
 
 # --- MAIN ---
 if __name__ == "__main__":
