@@ -25,11 +25,16 @@ BOT_TOKEN = os.getenv("ANTISCAM_BOT_TOKEN")
 KEYWORDS_FILE = "keywords.json"
 FED_STATS_FILE = "stats.json"
 FED_CONFIG_FILE = "config.json"
+FED_BANS_FILE = "bans.json"
+SYNC_STATUS_FILE = "sync_status.json"
 active_scans = {}
 stats_lock = asyncio.Lock()
 keywords_lock = asyncio.Lock()
 config_lock = asyncio.Lock()
+fed_bans_lock = asyncio.Lock()
+sync_status_lock = asyncio.Lock()
 bio_check_cache = {}
+_has_synced_once = False
 
 # --- DATA HANDLING & KEYWORD MATCHING ---
 def load_federation_config():
@@ -42,7 +47,43 @@ def load_federation_config():
     else:
         logger.error(f"{FED_CONFIG_FILE} not found.")
         return {}
-    
+
+async def load_fed_bans():
+    """Loads the master federated ban list from its JSON file."""
+    async with fed_bans_lock:
+        if not os.path.exists(FED_BANS_FILE):
+            return {}
+        with open(FED_BANS_FILE, 'r', encoding='utf-8') as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                logger.error(f"Could not decode {FED_BANS_FILE}.")
+                return {}
+
+async def save_fed_bans(data: dict):
+    """Saves the master federated ban list to its JSON file."""
+    async with fed_bans_lock:
+        with open(FED_BANS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
+
+async def load_sync_status():
+    """Loads the list of synced guild IDs."""
+    async with sync_status_lock:
+        if not os.path.exists(SYNC_STATUS_FILE):
+            return {"synced_guild_ids": []}
+        with open(SYNC_STATUS_FILE, 'r', encoding='utf-8') as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                logger.error(f"Could not decode {SYNC_STATUS_FILE}.")
+                return {"synced_guild_ids": []}
+
+async def save_sync_status(data: dict):
+    """Saves the list of synced guild IDs."""
+    async with sync_status_lock:
+        with open(SYNC_STATUS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
+
 async def load_fed_stats():
     async with stats_lock:
         if os.path.exists(FED_STATS_FILE):
@@ -74,64 +115,6 @@ async def save_keywords(keywords_data: dict):
         with open(KEYWORDS_FILE, 'w', encoding='utf-8') as f:
             json.dump(keywords_data, f, indent=4)
 
-def get_timeout_minutes_for_guild(guild: discord.Guild) -> int:
-    """Gets the configured timeout duration in minutes for a specific guild."""
-    config = bot.config
-    per_guild_settings = config.get("timeout_duration_minutes_per_guild", {})
-    guild_id_str = str(guild.id)
-    if guild_id_str in per_guild_settings:
-        return per_guild_settings[guild_id_str]
-    
-    return config.get("timeout_duration_minutes_default", 10)
-
-def get_delete_days_for_guild(guild: discord.Guild) -> int:
-    """Gets the configured message deletion days for a specific guild."""
-    config = bot.config
-    per_guild_settings = config.get("delete_messages_on_ban_days_per_guild", {})
-    guild_id_str = str(guild.id)
-    if guild_id_str in per_guild_settings:
-        return per_guild_settings[guild_id_str]
-    
-    return config.get("delete_messages_on_ban_days_default", 1)
-
-def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list:
-    """
-    Checks a given string against a specific ruleset (e.g., username rules or bio rules).
-    """
-    if not text_to_check or not ruleset:
-        return []
-
-    triggered = []
-    normalized_text = unidecode(text_to_check).lower()
-
-    # Username checks (substring and smart)
-    for keyword in ruleset.get("substring", []):
-        if keyword.lower() in normalized_text:
-            triggered.append(keyword)
-    for keyword in ruleset.get("smart", []):
-        pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
-        if re.search(pattern, normalized_text):
-            triggered.append(keyword)
-
-    # Bio/Message checks (simple and regex)
-    for keyword in ruleset.get("simple_keywords", []):
-        pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
-        if re.search(pattern, normalized_text):
-            triggered.append(keyword)
-    
-    texts_to_scan_regex = {text_to_check, normalized_text}
-    for pattern in ruleset.get("regex_patterns", []):
-        try:
-            for txt in texts_to_scan_regex:
-                if re.search(pattern, txt, re.IGNORECASE):
-                    if "Matched Regex Pattern" not in triggered:
-                        triggered.append("Matched Regex Pattern")
-                    break
-        except re.error as e:
-            logger.warning(f"Invalid regex pattern in {KEYWORDS_FILE}: '{pattern}' - {e}")
-            continue
-            
-    return list(set(triggered))
 
 # --- UI ---
 class ScreeningView(discord.ui.View):
@@ -441,6 +424,95 @@ class RegexTestModal(discord.ui.Modal, title="Regex Test"):
         logger.error(f"Error in RegexTestModal: {error}", exc_info=True)
         await interaction.response.send_message("An unexpected error occurred. Please check the logs.", ephemeral=True)
 
+class OnboardView(discord.ui.View):
+    def __init__(self, author: discord.User, fed_bans: dict):
+        super().__init__(timeout=300.0) # 5 minute timeout to confirm
+        self.author = author
+        self.fed_bans = fed_bans
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("You are not the one who initiated this command.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Begin Onboarding", style=discord.ButtonStyle.danger)
+    async def begin_onboarding(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(view=self)
+
+        progress_embed = discord.Embed(
+            title="⏳ Onboarding in Progress...",
+            description="Applying historical bans. This may take some time.",
+            color=discord.Color.orange()
+        )
+        progress_embed.add_field(name="Checked", value="`0`", inline=True)
+        progress_embed.add_field(name="Applied", value="`0`", inline=True)
+        progress_embed.add_field(name="Failed", value="`0`", inline=True)
+        
+        progress_message = await interaction.followup.send(embed=progress_embed, wait=True)
+
+        target_guild = interaction.guild
+        total_bans = len(self.fed_bans)
+        applied_count = 0
+        already_banned_count = 0
+        failed_count = 0
+        update_interval = 25
+
+        for i, (user_id_str, ban_data) in enumerate(self.fed_bans.items()):
+            user_id = int(user_id_str)
+            user_obj = discord.Object(id=user_id)
+
+            try:
+                await target_guild.fetch_ban(user_obj)
+                already_banned_count += 1
+                continue
+            except discord.NotFound:
+                try:
+                    reason = f"Federated ban sync. Original reason: {ban_data.get('reason', 'N/A')}"
+                    delete_days = get_delete_days_for_guild(target_guild)
+                    delete_seconds = delete_days * 86400
+                    await target_guild.ban(user_obj, reason=reason[:512], delete_message_seconds=delete_seconds)
+                    applied_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to onboard-ban user {user_id} in {target_guild.name}: {e}")
+                    failed_count += 1
+            
+            if (i + 1) % update_interval == 0 or (i + 1) == total_bans:
+                progress_embed.set_field_at(0, name="Checked", value=f"`{i+1} / {total_bans}`", inline=True)
+                progress_embed.set_field_at(1, name="Applied", value=f"`{applied_count}`", inline=True)
+                progress_embed.set_field_at(2, name="Failed", value=f"`{failed_count}`", inline=True)
+                await progress_message.edit(embed=progress_embed)
+
+        completion_embed = discord.Embed(
+            title="✅ Onboarding Complete",
+            description=f"The server is now up to date with the federated ban list.",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        completion_embed.add_field(name="Bans Applied", value=f"`{applied_count}`", inline=True)
+        completion_embed.add_field(name="Already Banned", value=f"`{already_banned_count}`", inline=True)
+        completion_embed.add_field(name="Failed", value=f"`{failed_count}`", inline=True)
+        
+        await progress_message.edit(content=None, embed=completion_embed)
+
+        sync_status = await load_sync_status()
+        if target_guild.id not in sync_status["synced_guild_ids"]:
+            sync_status["synced_guild_ids"].append(target_guild.id)
+            await save_sync_status(sync_status)
+        
+        await update_onboard_command_visibility(interaction.guild)
+        logger.info(f"Server {interaction.guild.name} has been successfully onboarded and permissions updated.")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Onboarding cancelled.", view=self, embed=None)
+
 # --- BOT SETUP ---
 intents = discord.Intents.default()
 intents.guilds = True
@@ -454,10 +526,10 @@ class AntiScamBot(discord.Client):
         self.tree = discord.app_commands.CommandTree(self)
         self.config = load_federation_config() 
 
-    async def setup_hook(self) -> None:
-        await self.tree.sync()
 bot = AntiScamBot(intents=intents)
 
+
+# --- PERMISSION CHECKS ---
 def is_bot_owner():
     """A check decorator to ensure the user is the bot's owner."""
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -465,6 +537,38 @@ def is_bot_owner():
         if interaction.user.id == app_info.owner.id:
             return True
         return False
+    return discord.app_commands.check(predicate)
+
+def has_mod_role():
+    """
+    A check decorator that passes if the command user has a federated moderator role
+    in the current guild, OR if the user is the bot owner.
+    """
+    async def predicate(interaction: discord.Interaction) -> bool:
+        config = interaction.client.config
+        
+        bot_owner_id = config.get("bot_owner_id")
+        if bot_owner_id and interaction.user.id == bot_owner_id:
+            return True
+
+        if not interaction.guild: return False
+
+        if interaction.guild.id not in config.get("federated_guild_ids", []):
+            await interaction.response.send_message("❌ This command can only be used in a federated server.", ephemeral=True)
+            return False
+
+        whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(interaction.guild.id), [])
+        if not whitelisted_mod_roles:
+            await interaction.response.send_message("❌ Moderator roles are not configured for this server.", ephemeral=True)
+            return False
+
+        user_role_ids = {role.id for role in interaction.user.roles}
+        if any(role_id in whitelisted_mod_roles for role_id in user_role_ids):
+            return True
+        
+        await interaction.response.send_message("❌ You do not have the required role to use this command.", ephemeral=True)
+        return False
+
     return discord.app_commands.check(predicate)
 
 async def has_federated_mod_role(interaction: discord.Interaction, config: dict) -> bool:
@@ -480,18 +584,88 @@ async def has_federated_mod_role(interaction: discord.Interaction, config: dict)
         return False
     return True
 
-# --- CORE EVENT LISTENERS ---
+async def is_federated_moderator(user_id_to_check: int) -> bool:
+    """Checks if a user ID belongs to a moderator in ANY federated server concurrently."""
+    config = bot.config
+    
+    all_mod_roles = {
+        role_id
+        for role_list in config.get("moderator_roles_per_guild", {}).values()
+        for role_id in role_list
+    }
+
+    if not all_mod_roles:
+        return False
+
+    async def check_guild(guild_id: int):
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return False
+        
+        try:
+            member = None
+            for attempt in range(3):
+                try:
+                    member = await guild.fetch_member(user_id_to_check)
+                    break
+                except discord.HTTPException as e:
+                    if e.status == 503 and attempt < 2:
+                        await asyncio.sleep(2 * (attempt + 1))
+                        continue
+                    raise
+            
+            if not member: return False
+            return any(role.id in all_mod_roles for role in member.roles)
+        
+        except discord.NotFound:
+            return False
+        except Exception as e:
+            logger.warning(f"Could not fetch member {user_id_to_check} in guild {guild.name} for is_federated_moderator check: {e}")
+            return False
+
+    tasks = [asyncio.create_task(check_guild(guild_id)) for guild_id in config.get("federated_guild_ids", [])]
+    
+    for future in asyncio.as_completed(tasks):
+        result = await future
+        if result:
+            logger.info(f"is_federated_moderator check PASSED for {user_id_to_check}.")
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            return True
+    
+    return False
+
+
+# --- EVENT LISTENERS ---
 @bot.event
 async def on_ready():
+    global _has_synced_once 
+
     logger.info(f'{bot.user.name} has connected to Discord!')
     logger.info(f"Operating in {len(bot.guilds)} federated guilds.")
     bot.add_view(ScreeningView(flagged_member_id=None))
     bot.add_view(FederatedAlertView(banned_user_id=None))
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} slash command(s).")
-    except Exception as e:
-        logger.error(f"Failed to sync slash commands: {e}")
+    # try:
+    #     synced = await bot.tree.sync()
+    #     logger.info(f"Synced {len(synced)} slash command(s).")
+    # except Exception as e:
+    #     logger.error(f"Failed to sync slash commands: {e}")
+
+    if not _has_synced_once:
+        try:
+            logger.info("Performing one-time command sync...")
+            synced = await bot.tree.sync()
+            logger.info(f"Synced {len(synced)} command(s) globally.")
+            _has_synced_once = True # Set the flag so it doesn't run again on reconnect
+        except Exception as e:
+            logger.error(f"Failed to perform one-time sync: {e}", exc_info=True)
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Called when the bot joins a new guild."""
+    logger.info(f"Joined new guild: {guild.name} ({guild.id}). Setting up command permissions.")
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -634,6 +808,10 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
         logger.info(f"Ban of {user} in {guild.name} could not be attributed. No federated action.")
         return
     
+    if "Federated ban sync" in ban_reason:
+        logger.info(f"Ignoring on_member_ban event for sync-related ban of {user.name}.")
+        return
+    
     if "Proactive ban initiated by" in ban_reason:
         logger.info(f"Ignoring on_member_ban event for proactive ban of {user.name}.")
         return
@@ -711,12 +889,25 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     if "monthly_initiated" not in stats[guild_id_str]: stats[guild_id_str]["monthly_initiated"] = {}
     stats[guild_id_str]["monthly_initiated"][current_month_key] = stats[guild_id_str]["monthly_initiated"].get(current_month_key, 0) + 1
 
+    display_reason = ""
     if not detailed_reason_field:
         default_reason = config.get("manual_ban_default_reason", "Scam")
         display_reason = ban_reason if ban_reason != "No reason provided." else default_reason
         detailed_reason_field = {"name": "Ban Reason", "value": f"```{display_reason[:1000]}```"}
     else:
         display_reason = detailed_reason_field["value"].strip("`")
+    
+    fed_bans = await load_fed_bans()
+    
+    fed_bans[str(user.id)] = {
+        "username_at_ban": user.name,
+        "ban_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "origin_guild_id": guild.id,
+        "origin_guild_name": guild.name,
+        "reason": display_reason,
+        "initiating_moderator_id": moderator.id
+    }
+    await save_fed_bans(fed_bans)
 
     if "global" not in stats: stats["global"] = {}
     stats["global"]["total_federated_actions_lifetime"] = stats["global"].get("total_federated_actions_lifetime", 0) + 1
@@ -840,6 +1031,17 @@ async def propagate_ban(origin_guild: discord.Guild, user_to_ban: discord.User, 
 
     logger.info(f"INITIATING FEDERATED BAN for {user_to_ban.name} from origin {origin_guild.name} by {moderator.name}.")
 
+    fed_bans = await load_fed_bans()
+    fed_bans[str(user_to_ban.id)] = {
+        "username_at_ban": user_to_ban.name,
+        "ban_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "origin_guild_id": origin_guild.id,
+        "origin_guild_name": origin_guild.name,
+        "reason": reason,
+        "initiating_moderator_id": moderator.id
+    }
+    await save_fed_bans(fed_bans)
+    
     detailed_reason_field = {"name": "Ban Reason", "value": f"```{reason[:1000]}```"}
 
     for guild_id in config.get("federated_guild_ids", []):
@@ -848,11 +1050,9 @@ async def propagate_ban(origin_guild: discord.Guild, user_to_ban: discord.User, 
         
         if target_guild.id == origin_guild.id:
             try:
-                # First, check if the user is already banned.
                 await target_guild.fetch_ban(user_to_ban)
                 logger.info(f"User {user_to_ban.name} was already banned in the origin guild {target_guild.name}.")
             except discord.NotFound:
-                # If not found, then proceed with the ban.
                 try:
                     delete_seconds = get_delete_days_for_guild(target_guild) * 86400
                     await target_guild.ban(user_to_ban, reason=f"Proactive ban initiated by {moderator.name}. Reason: {reason}", delete_message_seconds=delete_seconds)
@@ -946,7 +1146,6 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
         logger.info(f"Unban of {user} in {guild.name} could not be attributed.")
         return
 
-    # Determine the type of unban and if it should be propagated globally.
     is_authorized, authorization_method = False, "Unknown"
     should_propagate = False # Default to local action
 
@@ -990,6 +1189,13 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
     
     # Only enter the propagation block if it's a global action.
     if should_propagate:
+        fed_bans = await load_fed_bans()
+        user_id_str = str(user.id)
+        if user_id_str in fed_bans:
+            del fed_bans[user_id_str]
+            await save_fed_bans(fed_bans)
+            logger.info(f"Removed user {user.id} from the master federated ban list.")
+            
         log_channel_id = config.get("log_channel_id")
         log_channel = bot.get_channel(log_channel_id) if log_channel_id else None
         if log_channel:
@@ -1076,7 +1282,68 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
     await save_fed_stats(stats)
 
 
+# --- SCREENING HELPERS ---
+def get_timeout_minutes_for_guild(guild: discord.Guild) -> int:
+    """Gets the configured timeout duration in minutes for a specific guild."""
+    config = bot.config
+    per_guild_settings = config.get("timeout_duration_minutes_per_guild", {})
+    guild_id_str = str(guild.id)
+    if guild_id_str in per_guild_settings:
+        return per_guild_settings[guild_id_str]
+    
+    return config.get("timeout_duration_minutes_default", 10)
 
+def get_delete_days_for_guild(guild: discord.Guild) -> int:
+    """Gets the configured message deletion days for a specific guild."""
+    config = bot.config
+    per_guild_settings = config.get("delete_messages_on_ban_days_per_guild", {})
+    guild_id_str = str(guild.id)
+    if guild_id_str in per_guild_settings:
+        return per_guild_settings[guild_id_str]
+    
+    return config.get("delete_messages_on_ban_days_default", 1)
+
+def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list:
+    """
+    Checks a given string against a specific ruleset (e.g., username rules or bio rules).
+    """
+    if not text_to_check or not ruleset:
+        return []
+
+    triggered = []
+    normalized_text = unidecode(text_to_check).lower()
+
+    # Username checks (substring and smart)
+    for keyword in ruleset.get("substring", []):
+        if keyword.lower() in normalized_text:
+            triggered.append(keyword)
+    for keyword in ruleset.get("smart", []):
+        pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
+        if re.search(pattern, normalized_text):
+            triggered.append(keyword)
+
+    # Bio/Message checks (simple and regex)
+    for keyword in ruleset.get("simple_keywords", []):
+        pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
+        if re.search(pattern, normalized_text):
+            triggered.append(keyword)
+    
+    texts_to_scan_regex = {text_to_check, normalized_text}
+    for pattern in ruleset.get("regex_patterns", []):
+        try:
+            for txt in texts_to_scan_regex:
+                if re.search(pattern, txt, re.IGNORECASE):
+                    if "Matched Regex Pattern" not in triggered:
+                        triggered.append("Matched Regex Pattern")
+                    break
+        except re.error as e:
+            logger.warning(f"Invalid regex pattern in {KEYWORDS_FILE}: '{pattern}' - {e}")
+            continue
+            
+    return list(set(triggered))
+
+
+# --- SCREENING ---
 async def screen_member(member: discord.Member, config: dict, keywords_data: dict) -> dict:
     """
     Performs the complete screening process for a single member and returns the findings.
@@ -1306,13 +1573,14 @@ async def run_full_scan(interaction: discord.Interaction):
 
 
 # --- OWNER SLASH COMMANDS ---
-@bot.tree.command(name="zreloadconfig", description="[Owner Only] Reloads federation config and updates keyword file.")
+@bot.tree.command(name="zreloadconfig", description="[Owner Only] Reloads configuration files from disk.")
 @is_bot_owner()
 async def reloadconfig(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     logger.info(f"OWNER COMMAND: {interaction.user.name} triggered a configuration reload.")
     
     bot.config = load_federation_config()
+    
     keywords_data = await load_keywords()
     
     if not bot.config or keywords_data is None:
@@ -1337,12 +1605,539 @@ async def reloadconfig(interaction: discord.Interaction):
         await save_keywords(keywords_data)
 
     await interaction.followup.send(
-        f"✅ **Configuration cache reloaded successfully.**\n"
-        f"The bot is now operating with the latest settings from `config.json`.\n"
+        f"✅ **Configuration reloaded successfully.**\n"
         f"Now managing **{len(federated_guild_ids)}** federated servers.\n"
         f"{'Keyword file was updated with new server entries.' if updated else 'No new servers found to add.'}"
     )
 
+@bot.tree.command(name="zadd-global-name-substring", description="[Owner Only] Adds a SUBSTRING keyword to the GLOBAL list.")
+@discord.app_commands.describe(keyword="The keyword to add globally (e.g., 'admin').")
+@is_bot_owner()
+async def add_global_username_substring(interaction: discord.Interaction, keyword: str):
+    await interaction.response.defer(ephemeral=True)
+    await add_global_keyword_to_list(interaction, keyword, "username_keywords", "substring")
+
+@bot.tree.command(name="zadd-global-name-smart", description="[Owner Only] Adds a SMART keyword to the GLOBAL list.")
+@discord.app_commands.describe(keyword="The keyword to add globally (e.g., 'mod').")
+@is_bot_owner()
+async def add_global_username_smart(interaction: discord.Interaction, keyword: str):
+    await interaction.response.defer(ephemeral=True)
+    await add_global_keyword_to_list(interaction, keyword, "username_keywords", "smart")
+
+@bot.tree.command(name="zadd-global-bio-msg-keyword", description="[Owner Only] Adds a BIO keyword to the GLOBAL list.")
+@discord.app_commands.describe(keyword="The keyword or phrase to add globally.")
+@is_bot_owner()
+async def add_global_bio_keyword(interaction: discord.Interaction, keyword: str):
+    await interaction.response.defer(ephemeral=True)
+    await add_global_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
+
+@bot.tree.command(name="zadd-global-regex", description="[OWNER ONLY] Adds a regex pattern to the GLOBAL list.")
+@discord.app_commands.describe(pattern="The exact regex pattern to add globally.")
+@is_bot_owner()
+async def add_global_regex(interaction: discord.Interaction, pattern: str):
+    await interaction.response.defer(ephemeral=True)
+    await add_regex_to_list(interaction, pattern, is_global=True)
+
+@bot.tree.command(name="zrm-global-name-substring", description="[Owner Only] Removes a SUBSTRING keyword from the GLOBAL list.")
+@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+@is_bot_owner()
+async def remove_global_username_substring(interaction: discord.Interaction, keyword: str):
+    await interaction.response.defer(ephemeral=True)
+    await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "substring")
+
+@bot.tree.command(name="zrm-global-name-smart", description="[Owner Only] Removes a SMART keyword from the GLOBAL list.")
+@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+@is_bot_owner()
+async def remove_global_username_smart(interaction: discord.Interaction, keyword: str):
+    await interaction.response.defer(ephemeral=True)
+    await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "smart")
+
+@bot.tree.command(name="zrm-global-bio-msg-keyword", description="[Owner Only] Removes a BIO keyword from the GLOBAL list.")
+@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
+@is_bot_owner()
+async def remove_global_bio_keyword(interaction: discord.Interaction, keyword: str):
+    await interaction.response.defer(ephemeral=True)
+    await remove_global_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
+
+@bot.tree.command(name="zrm-global-regex-by-id", description="[OWNER ONLY] Removes a regex from the GLOBAL list by its ID.")
+@discord.app_commands.describe(index="The numerical ID of the global regex pattern to remove.")
+@is_bot_owner()
+async def remove_global_regex_by_id(interaction: discord.Interaction, index: int):
+    await interaction.response.defer(ephemeral=True)
+    await remove_regex_from_list_by_id(interaction, index, is_global=True)
+
+@bot.tree.command(name="admin-backfill-banlist", description="[OWNER ONLY] Populates the master ban list from historical audit logs.")
+@is_bot_owner()
+async def admin_backfill_banlist(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    progress_message = await interaction.channel.send("🔍 **Phase 1/4: Collecting historical ban data...**")
+    await interaction.followup.send("✅ **Starting historical backfill.** This is a complex operation and may take several minutes. Progress is being updated in the channel above.", ephemeral=True)
+    
+    config = bot.config
+    bot_owner_id = config.get("bot_owner_id")
+    potential_bans = {}
+    unbanned_users = set()
+
+    ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
+    
+    for guild_id in config.get("federated_guild_ids", []):
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            logger.warning(f"Backfill: Could not find guild {guild_id}, skipping.")
+            continue
+
+        await progress_message.edit(content=f"⏳ **Phase 1/4:** Processing ban logs for **{guild.name}**...")
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, after=ninety_days_ago, limit=None):
+                moderator = entry.user
+                target_user = entry.target
+
+                if target_user.id == bot.user.id or (bot_owner_id and target_user.id == bot_owner_id):
+                    continue
+
+                is_authorized = False
+                if moderator.id == bot.user.id:
+                    is_authorized = True
+                elif not moderator.bot and isinstance(moderator, discord.Member):
+                    whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(guild.id), [])
+                    if any(role.id in whitelisted_mod_roles for role in moderator.roles):
+                        is_authorized = True
+                
+                if is_authorized:
+                    if target_user.id not in potential_bans or entry.created_at > datetime.fromisoformat(potential_bans[target_user.id]["ban_timestamp_utc"]):
+                        potential_bans[target_user.id] = {
+                            "username_at_ban": target_user.name,
+                            "ban_timestamp_utc": entry.created_at.isoformat(),
+                            "origin_guild_id": guild.id,
+                            "origin_guild_name": guild.name,
+                            "reason": entry.reason or "No reason provided.",
+                            "initiating_moderator_id": moderator.id
+                        }
+            
+            await progress_message.edit(content=f"⏳ **Phase 2/4:** Processing unban logs for **{guild.name}**...")
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.unban, after=ninety_days_ago, limit=None):
+                moderator = entry.user
+                is_authorized = False
+                if moderator.id == bot.user.id:
+                    is_authorized = True
+                elif not moderator.bot and isinstance(moderator, discord.Member):
+                    whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(guild.id), [])
+                    if any(role.id in whitelisted_mod_roles for role in moderator.roles):
+                        is_authorized = True
+                
+                if is_authorized:
+                    unbanned_users.add(entry.target.id)
+
+        except discord.Forbidden:
+            logger.error(f"Backfill: Missing 'View Audit Log' permission in {guild.name}. Skipping.")
+            await interaction.followup.send(f"❌ Missing 'View Audit Log' permission in **{guild.name}**. That server could not be processed.", ephemeral=True)
+            continue
+        except Exception as e:
+            logger.error(f"Backfill: An unexpected error occurred while processing {guild.name}: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ An error occurred while processing **{guild.name}**. Check logs.", ephemeral=True)
+            continue
+
+    await progress_message.edit(content=f"⚙️ **Phase 3/4:** Reconciling `{len(potential_bans)}` bans against `{len(unbanned_users)}` unbans...")
+    reconciled_bans = {
+        user_id: ban_data
+        for user_id, ban_data in potential_bans.items()
+        if user_id not in unbanned_users
+    }
+
+    await progress_message.edit(content=f"🛡️ **Phase 4/4:** Performing final sanity checks on `{len(reconciled_bans)}` reconciled bans...")
+    
+    all_whitelisted_roles = {
+        role_id
+        for role_list in config.get("whitelisted_roles_per_guild", {}).values()
+        for role_id in role_list
+    }
+
+    fed_bans = await load_fed_bans()
+    initial_ban_count = len(fed_bans)
+    newly_added_count = 0
+
+    for user_id, ban_data in reconciled_bans.items():
+        if str(user_id) in fed_bans:
+            continue
+
+        # Is the user currently a federated moderator?
+        if await is_federated_moderator(user_id):
+            logger.info(f"Backfill: Ignoring ban for {user_id} as they are now a federated moderator.")
+            continue
+
+        is_untouchable = False
+        for guild_id in config.get("federated_guild_ids", []):
+            guild = bot.get_guild(guild_id)
+            if not guild: continue
+            
+            try:
+                member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+                
+                # Do they have a whitelisted role?
+                if any(role.id in all_whitelisted_roles for role in member.roles):
+                    logger.info(f"Backfill: Ignoring ban for {user_id} as they have a whitelisted role in {guild.name}.")
+                    is_untouchable = True
+                    break
+
+                # Do they have a role higher than the bot?
+                if member.top_role.position >= guild.me.top_role.position:
+                    logger.info(f"Backfill: Ignoring ban for {user_id} as they have a superior role in {guild.name}.")
+                    is_untouchable = True
+                    break
+            except discord.NotFound:
+                continue # User not in this guild, so no roles to check.
+        
+        if is_untouchable:
+            continue
+
+        fed_bans[str(user_id)] = ban_data
+        newly_added_count += 1
+
+    await save_fed_bans(fed_bans)
+    final_ban_count = len(fed_bans)
+    newly_added_count = final_ban_count - initial_ban_count
+
+    completion_embed = discord.Embed(
+        title="✅ Historical Backfill Complete",
+        description="The master federated ban list has been populated with historical data.",
+        color=discord.Color.green()
+    )
+    completion_embed.add_field(name="Initial Bans", value=f"`{initial_ban_count}`", inline=True)
+    completion_embed.add_field(name="Newly Added", value=f"`{newly_added_count}`", inline=True)
+    completion_embed.add_field(name="Total Bans", value=f"`{final_ban_count}`", inline=True)
+    completion_embed.set_footer(text="This command can now be removed from the code.")
+
+    await progress_message.edit(content=None, embed=completion_embed)
+    logger.info(f"Historical backfill complete. Added {newly_added_count} new bans to the master list.")
+
+@bot.tree.command(name="zsync", description="[OWNER ONLY] Syncs the command tree with Discord.")
+@is_bot_owner()
+async def zsync(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    synced = await bot.tree.sync()
+    await interaction.followup.send(f"✅ Synced {len(synced)} command(s) globally.")
+    logger.info(f"Command tree synced by {interaction.user.name}. Synced {len(synced)} commands.")
+
+    
+
+# --- MODERATOR SLASH COMMANDS ---
+@bot.tree.command(name="stats", description="Displays local and federated ban statistics.")
+@has_mod_role()
+async def stats(interaction: discord.Interaction):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer()
+    stats = await load_fed_stats()
+    guild_id_str = str(interaction.guild.id)
+    current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+    guild_stats = stats.get(guild_id_str, {})
+    bans_initiated_monthly = guild_stats.get("monthly_initiated", {}).get(current_month_key, 0)
+    bans_initiated_lifetime = guild_stats.get("bans_initiated_lifetime", 0)
+    bans_received_monthly = guild_stats.get("monthly_received", {}).get(current_month_key, 0)
+    bans_received_lifetime = guild_stats.get("bans_received_lifetime", 0)
+    total_federated_actions_lifetime = stats.get("global", {}).get("total_federated_actions_lifetime", 0)
+    embed = discord.Embed(
+        title="🛡️ Ban Statistics",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+    embed.add_field(name="Bans Initiated from This Server", value=f"**`{bans_initiated_monthly}`** (This Month)\n**`{bans_initiated_lifetime}`** (All Time)", inline=False)
+    embed.add_field(name="Bans Received in This Server", value=f"**`{bans_received_monthly}`** (This Month)\n**`{bans_received_lifetime}`** (All Time)", inline=False)
+    embed.add_field(name="Total Federated Bans (All Time)", value=f"**`{total_federated_actions_lifetime}`**\n*Total federated bans across all servers.*", inline=False)
+    await interaction.followup.send(embed=embed)
+        
+@bot.tree.command(name="list-keywords", description="Lists all active screening keywords for this server.")
+@has_mod_role()
+async def list_keywords(interaction: discord.Interaction):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+
+    keywords_data = await load_keywords()
+    guild_id_str = str(interaction.guild.id)
+
+    local_rules = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {})
+    local_output = format_keyword_list(local_rules, "🔑 Local Keywords for this Server")
+
+    global_rules = keywords_data.get("global_keywords", {})
+    global_output = format_keyword_list(global_rules, "🌍 Global Keywords (Applied to all Servers)")
+
+    embed = discord.Embed(
+        title=f"Screening Keywords for {interaction.guild.name}",
+        description=local_output + global_output,
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="add-name-keyword-substring", description="Aggressive name keyword (catches variations: 'admin' in 'daoadmin' 'admin123').")
+@has_mod_role()
+@discord.app_commands.describe(keyword="Example: 'admin' will match 'listadaoadmin' or 'admin123'.")
+async def add_username_keyword_substring(interaction: discord.Interaction, keyword: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await add_keyword_to_list(interaction, keyword, "username_keywords", "substring")
+
+@bot.tree.command(name="add-name-keyword-smart", description="Precise name keyword (avoids false positives: 'mod' in 'mod123' not 'modern').")
+@has_mod_role()
+@discord.app_commands.describe(keyword="Example: 'mod' will match 'mod123' but IGNORE 'modern'.")
+async def add_username_keyword_smart(interaction: discord.Interaction, keyword: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await add_keyword_to_list(interaction, keyword, "username_keywords", "smart")
+
+@bot.tree.command(name="add-bio-msg-keyword", description="Keyword for screening user bios and messages.")
+@has_mod_role()
+@discord.app_commands.describe(keyword="The keyword or phrase to add (e.g., 'dm me for help').")
+async def add_bio_keyword(interaction: discord.Interaction, keyword: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await add_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
+
+@bot.tree.command(name="test-regex", description="Tests a regex pattern against sample text using a pop-up form.")
+@has_mod_role()
+@discord.app_commands.describe(pattern="The regex pattern to test. Remember to escape special characters (e.g., '\\.').")
+async def test_regex(interaction: discord.Interaction, pattern: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config):
+        return
+
+    try:
+        compiled_regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        await interaction.response.send_message(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`", ephemeral=True)
+        return
+
+    modal = RegexTestModal(pattern=pattern, compiled_regex=compiled_regex)
+    await interaction.response.send_modal(modal)
+
+@bot.tree.command(name="add-regex", description="Adds a regex pattern to this server's local list. Try /test-regex first!")
+@has_mod_role()
+@discord.app_commands.describe(pattern="The exact regex pattern. Use standard regex escaping (e.g., '\\.' for a dot, '\\s' for whitespace).")
+async def add_local_regex(interaction: discord.Interaction, pattern: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await add_regex_to_list(interaction, pattern, is_global=False)
+
+@bot.tree.command(name="rm-name-keyword-substring", description="Removes a SUBSTRING keyword from this server's local list.")
+@has_mod_role()
+@discord.app_commands.describe(keyword="The exact keyword to remove.")
+async def remove_username_keyword_substring(interaction: discord.Interaction, keyword: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await remove_keyword_from_list(interaction, keyword, "username_keywords", "substring")
+
+@bot.tree.command(name="rm-name-keyword-smart", description="Removes a SMART keyword from this server's local list.")
+@has_mod_role()
+@discord.app_commands.describe(keyword="The exact keyword to remove.")
+async def remove_username_keyword_smart(interaction: discord.Interaction, keyword: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await remove_keyword_from_list(interaction, keyword, "username_keywords", "smart")
+
+@bot.tree.command(name="rm-bio-msg-keyword", description="Removes a keyword from this server's local bio/message list.")
+@has_mod_role()
+@discord.app_commands.describe(keyword="The exact keyword or phrase to remove.")
+async def remove_bio_keyword(interaction: discord.Interaction, keyword: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await remove_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
+
+@bot.tree.command(name="rm-regex-by-id", description="Removes a regex from the local list by its ID from /list-keywords.")
+@has_mod_role()
+@discord.app_commands.describe(index="The numerical ID of the regex pattern to remove.")
+async def remove_local_regex_by_id(interaction: discord.Interaction, index: int):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    await interaction.response.defer(ephemeral=True)
+    await remove_regex_from_list_by_id(interaction, index, is_global=False)
+
+@bot.tree.command(name="scanallmembers", description="Retroactively scans all server members against the screening list.")
+@has_mod_role()
+async def scanallmembers(interaction: discord.Interaction):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    if interaction.guild.id in active_scans:
+        await interaction.response.send_message("❌ A scan is already in progress for this server.", ephemeral=True)
+        return
+    member_count = interaction.guild.member_count
+    view = ConfirmScanView(author=interaction.user)
+    await interaction.response.send_message(f"⚠️ **Are you sure?**\nThis will scan all **{member_count}** members...", view=view, ephemeral=True)
+    await view.wait()
+    if view.value is True:
+        scan_task = bot.loop.create_task(run_full_scan(interaction))
+        active_scans[interaction.guild.id] = scan_task
+    else:
+        await interaction.followup.send("Scan cancelled or timed out.", ephemeral=True)
+
+@bot.tree.command(name="stopscan", description="Stops an ongoing member scan for this server.")
+@has_mod_role()
+async def stopscan(interaction: discord.Interaction):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config): return
+    guild_id = interaction.guild.id
+    if guild_id in active_scans:
+        active_scans[guild_id].cancel()
+        logger.info(f"Moderator {interaction.user.name} stopped the scan for guild {guild_id}.")
+        await interaction.response.send_message("✅ Scan cancellation requested.", ephemeral=True)
+    else:
+        await interaction.response.send_message("ℹ️ No scan is currently in progress.", ephemeral=True)
+
+@bot.tree.command(name="contact-maintainer", description="Send a message to the bot maintainer for requests, feedback, or issues.")
+@has_mod_role()
+@discord.app_commands.describe(message="Your message, feedback, or request for the bot maintainer.")
+async def contact_maintainer(interaction: discord.Interaction, message: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config):
+        return
+
+    log_channel_id = config.get("log_channel_id")
+    if not log_channel_id:
+        await interaction.response.send_message("❌ The bot's log channel is not configured. Please contact the owner directly.", ephemeral=True)
+        return
+
+    log_channel = bot.get_channel(log_channel_id)
+    if not log_channel:
+        try:
+            log_channel = await bot.fetch_channel(log_channel_id)
+        except (discord.NotFound, discord.Forbidden):
+            await interaction.response.send_message("❌ Could not find or access the bot's log channel. Please contact the owner directly.", ephemeral=True)
+            logger.error(f"Could not fetch log channel {log_channel_id} for contact-admin command.")
+            return
+
+    bot_owner_id = config.get("bot_owner_id")
+    if not bot_owner_id:
+        await interaction.response.send_message("❌ The bot owner's ID is not configured. Cannot send notification.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📬 Contact Request",
+        description=f"A new message has been sent by a moderator.",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="📝 Message", value=f"```{message[:1000]}```", inline=False)
+    embed.add_field(name="👤 Sender", value=f"{interaction.user.name} (`{interaction.user.id}`)", inline=True)
+    embed.add_field(name="🌐 Server", value=interaction.guild.name, inline=True)
+    embed.set_footer(text="This is a direct request from a federated moderator.")
+
+    try:
+        await log_channel.send(content=f"<@{bot_owner_id}>", embed=embed)
+        await interaction.response.send_message("✅ Your message has been successfully sent to the bot maintainer.", ephemeral=True)
+        logger.info(f"Moderator {interaction.user.name} from {interaction.guild.name} sent an admin contact request.")
+    except Exception as e:
+        await interaction.response.send_message("❌ An error occurred while trying to send your message. Please try again later.", ephemeral=True)
+        logger.error(f"Failed to send contact message to log channel: {e}", exc_info=True)
+
+@bot.tree.command(name="onboard-server", description="Onboards a new server by syncing the federated ban list.")
+@has_mod_role()
+async def onboard_server(interaction: discord.Interaction):
+    config = bot.config
+
+    sync_status = await load_sync_status()
+    if interaction.guild.id in sync_status["synced_guild_ids"]:
+        await interaction.response.send_message(
+            "❌ **Action Prohibited:** This server has already been onboarded. "
+            "Running this command again could incorrectly re-ban users who were locally unbanned. "
+            "If a full re-sync is required, please contact the bot administrator.",
+            ephemeral=True
+        )
+        return
+
+    fed_bans = await load_fed_bans()
+    ban_count = len(fed_bans)
+
+    if ban_count == 0:
+        await interaction.response.send_message("ℹ️ The federated ban list is currently empty. No onboarding action is needed.", ephemeral=True)
+        return
+
+    welcome_embed = discord.Embed(
+        title="👋 Welcome!",
+        description=(
+            "This server is now part of my federated Defi Antiscam protection. "
+            "I will screen new members, messages, and bios against a shared list of threats.\n\n"
+            "**Next Step: Onboarding**\n"
+            "To protect this server immediately, I will now apply all historical bans from the master federated ban list. "
+            "This is a one-time action."
+        ),
+        color=discord.Color.blue()
+    )
+    welcome_embed.add_field(
+        name="Bans to Apply",
+        value=f"**`{ban_count}`** users will be banned.",
+        inline=False
+    )
+    welcome_embed.set_footer(text="Click 'Begin Onboarding' to start the process. This cannot be undone.")
+
+    view = OnboardView(author=interaction.user, fed_bans=fed_bans)
+    await interaction.response.send_message(embed=welcome_embed, view=view)
+
+@bot.tree.command(name="global-ban", description="Proactively bans a user by ID across all federated servers.")
+@has_mod_role()
+@discord.app_commands.describe(user_id="The Discord User ID of the person to ban.", reason="The reason for the ban. This will be shown in all federated alerts.")
+async def global_ban(interaction: discord.Interaction, user_id: str, reason: str):
+    config = bot.config
+    if not await has_federated_mod_role(interaction, config):
+        return
+
+    if not user_id.isdigit():
+        await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID (numbers only).", ephemeral=True)
+        return
+    
+    target_user_id = int(user_id)
+
+    if target_user_id == interaction.user.id:
+        await interaction.response.send_message("❌ You cannot ban yourself.", ephemeral=True)
+        return
+    
+    if target_user_id == bot.user.id:
+        await interaction.response.send_message("❌ I cannot ban myself.", ephemeral=True)
+        return
+
+    try:
+        user_to_ban = await bot.fetch_user(target_user_id)
+    except discord.NotFound:
+        await interaction.response.send_message(f"❌ **User Not Found:** No user exists with the ID `{target_user_id}`.", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.response.send_message(f"❌ An error occurred while fetching the user: `{e}`", ephemeral=True)
+        logger.error(f"Failed to fetch user for global-ban command: {e}", exc_info=True)
+        return
+
+    if user_to_ban.bot:
+        await interaction.response.send_message("❌ **Action Prohibited:** You cannot target a bot account with this command.", ephemeral=True)
+        return
+
+    bot_owner_id = config.get("bot_owner_id")
+    if bot_owner_id and user_to_ban.id == bot_owner_id:
+        await interaction.response.send_message("❌ **Action Prohibited:** You cannot target the bot owner.", ephemeral=True)
+        return
+
+    if await is_federated_moderator(user_to_ban.id):
+        await interaction.response.send_message("❌ **Action Prohibited:** You cannot target another federated moderator. This action must be performed manually by the bot owner if necessary.", ephemeral=True)
+        return
+    
+    confirm_embed = discord.Embed(
+        title="⚠️ Confirm Global Ban",
+        description=f"You are about to issue a federated ban for the following user. This action cannot be easily undone and will affect **all** federated servers.",
+        color=discord.Color.orange()
+    )
+    confirm_embed.set_author(name=f"{user_to_ban.name} (`{user_to_ban.id}`)", icon_url=user_to_ban.display_avatar.url)
+    confirm_embed.add_field(name="Reason", value=f"```{reason}```", inline=False)
+
+    view = ConfirmGlobalBanView(author=interaction.user, user_to_ban=user_to_ban, reason=reason)
+    await interaction.response.send_message(embed=confirm_embed, view=view, ephemeral=True)
+
+
+# --- COMMAND HELPERS ---
 async def add_global_keyword_to_list(interaction: discord.Interaction, keyword: str, primary_key: str, secondary_key: str = None):
     """A helper to add a keyword to a specific GLOBAL list in the keywords.json file."""
     keyword = keyword.lower().strip()
@@ -1401,90 +2196,6 @@ async def remove_global_keyword_from_list(interaction: discord.Interaction, keyw
     else:
         await interaction.followup.send(f"❌ Keyword '{keyword}' was not found in the GLOBAL list.")
 
-# --- OWNER GLOBAL KEYWORD COMMANDS ---
-@bot.tree.command(name="zadd-global-name-substring", description="[Owner Only] Adds a SUBSTRING keyword to the GLOBAL list.")
-@discord.app_commands.describe(keyword="The keyword to add globally (e.g., 'admin').")
-@is_bot_owner()
-async def add_global_username_substring(interaction: discord.Interaction, keyword: str):
-    await interaction.response.defer(ephemeral=True)
-    await add_global_keyword_to_list(interaction, keyword, "username_keywords", "substring")
-
-@bot.tree.command(name="zadd-global-name-smart", description="[Owner Only] Adds a SMART keyword to the GLOBAL list.")
-@discord.app_commands.describe(keyword="The keyword to add globally (e.g., 'mod').")
-@is_bot_owner()
-async def add_global_username_smart(interaction: discord.Interaction, keyword: str):
-    await interaction.response.defer(ephemeral=True)
-    await add_global_keyword_to_list(interaction, keyword, "username_keywords", "smart")
-
-@bot.tree.command(name="zadd-global-bio-msg-keyword", description="[Owner Only] Adds a BIO keyword to the GLOBAL list.")
-@discord.app_commands.describe(keyword="The keyword or phrase to add globally.")
-@is_bot_owner()
-async def add_global_bio_keyword(interaction: discord.Interaction, keyword: str):
-    await interaction.response.defer(ephemeral=True)
-    await add_global_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
-
-# --- OWNER GLOBAL REGEX COMMANDS ---
-@bot.tree.command(name="zadd-global-regex", description="[OWNER ONLY] Adds a regex pattern to the GLOBAL list.")
-@discord.app_commands.describe(pattern="The exact regex pattern to add globally.")
-@is_bot_owner()
-async def add_global_regex(interaction: discord.Interaction, pattern: str):
-    await interaction.response.defer(ephemeral=True)
-    await add_regex_to_list(interaction, pattern, is_global=True)
-
-@bot.tree.command(name="zrm-global-name-substring", description="[Owner Only] Removes a SUBSTRING keyword from the GLOBAL list.")
-@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
-@is_bot_owner()
-async def remove_global_username_substring(interaction: discord.Interaction, keyword: str):
-    await interaction.response.defer(ephemeral=True)
-    await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "substring")
-
-@bot.tree.command(name="zrm-global-name-smart", description="[Owner Only] Removes a SMART keyword from the GLOBAL list.")
-@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
-@is_bot_owner()
-async def remove_global_username_smart(interaction: discord.Interaction, keyword: str):
-    await interaction.response.defer(ephemeral=True)
-    await remove_global_keyword_from_list(interaction, keyword, "username_keywords", "smart")
-
-@bot.tree.command(name="zrm-global-bio-msg-keyword", description="[Owner Only] Removes a BIO keyword from the GLOBAL list.")
-@discord.app_commands.describe(keyword="The exact keyword to remove globally.")
-@is_bot_owner()
-async def remove_global_bio_keyword(interaction: discord.Interaction, keyword: str):
-    await interaction.response.defer(ephemeral=True)
-    await remove_global_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
-
-@bot.tree.command(name="zrm-global-regex-by-id", description="[OWNER ONLY] Removes a regex from the GLOBAL list by its ID.")
-@discord.app_commands.describe(index="The numerical ID of the global regex pattern to remove.")
-@is_bot_owner()
-async def remove_global_regex_by_id(interaction: discord.Interaction, index: int):
-    await interaction.response.defer(ephemeral=True)
-    await remove_regex_from_list_by_id(interaction, index, is_global=True)
-
-# --- MODERATOR SLASH COMMANDS ---
-@bot.tree.command(name="stats", description="Displays local and federated ban statistics.")
-async def stats(interaction: discord.Interaction):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer()
-    stats = await load_fed_stats()
-    guild_id_str = str(interaction.guild.id)
-    current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
-    guild_stats = stats.get(guild_id_str, {})
-    bans_initiated_monthly = guild_stats.get("monthly_initiated", {}).get(current_month_key, 0)
-    bans_initiated_lifetime = guild_stats.get("bans_initiated_lifetime", 0)
-    bans_received_monthly = guild_stats.get("monthly_received", {}).get(current_month_key, 0)
-    bans_received_lifetime = guild_stats.get("bans_received_lifetime", 0)
-    total_federated_actions_lifetime = stats.get("global", {}).get("total_federated_actions_lifetime", 0)
-    embed = discord.Embed(
-        title="🛡️ Ban Statistics",
-        color=discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
-    embed.add_field(name="Bans Initiated from This Server", value=f"**`{bans_initiated_monthly}`** (This Month)\n**`{bans_initiated_lifetime}`** (All Time)", inline=False)
-    embed.add_field(name="Bans Received in This Server", value=f"**`{bans_received_monthly}`** (This Month)\n**`{bans_received_lifetime}`** (All Time)", inline=False)
-    embed.add_field(name="Total Federated Bans (All Time)", value=f"**`{total_federated_actions_lifetime}`**\n*Total federated bans across all servers.*", inline=False)
-    await interaction.followup.send(embed=embed)
-
 def format_keyword_list(ruleset: dict, list_title: str) -> str:
     """Helper to format a keyword set into a readable string for Discord."""
     output = f"**{list_title}**\n"
@@ -1515,29 +2226,6 @@ def format_keyword_list(ruleset: dict, list_title: str) -> str:
         output += "*No keywords configured in this category.*\n"
         
     return output + "\n"
-        
-@bot.tree.command(name="list-keywords", description="Lists all active screening keywords for this server.")
-async def list_keywords(interaction: discord.Interaction):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-
-    keywords_data = await load_keywords()
-    guild_id_str = str(interaction.guild.id)
-
-    local_rules = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {})
-    local_output = format_keyword_list(local_rules, "🔑 Local Keywords for this Server")
-
-    global_rules = keywords_data.get("global_keywords", {})
-    global_output = format_keyword_list(global_rules, "🌍 Global Keywords (Applied to all Servers)")
-
-    embed = discord.Embed(
-        title=f"Screening Keywords for {interaction.guild.name}",
-        description=local_output + global_output,
-        color=discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    await interaction.followup.send(embed=embed)
 
 async def add_keyword_to_list(interaction: discord.Interaction, keyword: str, primary_key: str, secondary_key: str = None):
     """A generic helper to add a keyword to a specific LOCAL list in the keywords.json file."""
@@ -1578,30 +2266,6 @@ async def add_keyword_to_list(interaction: discord.Interaction, keyword: str, pr
     logger.info(f"Moderator {interaction.user.name} in {interaction.guild.name} added keyword '{keyword}'.")
     await interaction.followup.send(f"✅ Keyword '{keyword}' has been added to this server's local list.")
 
-@bot.tree.command(name="add-name-keyword-substring", description="Aggressive name keyword (catches variations: 'admin' in 'daoadmin' 'admin123').")
-@discord.app_commands.describe(keyword="Example: 'admin' will match 'listadaoadmin' or 'admin123'.")
-async def add_username_keyword_substring(interaction: discord.Interaction, keyword: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-    await add_keyword_to_list(interaction, keyword, "username_keywords", "substring")
-
-@bot.tree.command(name="add-name-keyword-smart", description="Precise name keyword (avoids false positives: 'mod' in 'mod123' not 'modern').")
-@discord.app_commands.describe(keyword="Example: 'mod' will match 'mod123' but IGNORE 'modern'.")
-async def add_username_keyword_smart(interaction: discord.Interaction, keyword: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-    await add_keyword_to_list(interaction, keyword, "username_keywords", "smart")
-
-@bot.tree.command(name="add-bio-msg-keyword", description="Keyword for screening user bios and messages.")
-@discord.app_commands.describe(keyword="The keyword or phrase to add (e.g., 'dm me for help').")
-async def add_bio_keyword(interaction: discord.Interaction, keyword: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-    await add_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
-
 async def add_regex_to_list(interaction: discord.Interaction, pattern: str, is_global: bool):
     """A helper to add a regex pattern to the appropriate list after validating it."""
     try:
@@ -1639,42 +2303,6 @@ async def add_regex_to_list(interaction: discord.Interaction, pattern: str, is_g
     logger.info(f"User {interaction.user.name} added {list_name} regex: '{pattern}'")
     await interaction.followup.send(f"✅ Regex pattern has been successfully added to the **{list_name}** list.")
 
-
-
-@bot.tree.command(name="test-regex", description="Tests a regex pattern against sample text using a pop-up form.")
-@discord.app_commands.describe(
-    pattern="The regex pattern to test. Remember to escape special characters (e.g., '\\.')."
-)
-async def test_regex(interaction: discord.Interaction, pattern: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config):
-        return
-
-    try:
-        compiled_regex = re.compile(pattern, re.IGNORECASE)
-    except re.error as e:
-        await interaction.response.send_message(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`", ephemeral=True)
-        return
-
-    modal = RegexTestModal(pattern=pattern, compiled_regex=compiled_regex)
-    await interaction.response.send_modal(modal)
-
-@bot.tree.command(name="add-regex", description="Adds a regex pattern to this server's local list. Try /test-regex first!")
-@discord.app_commands.describe(pattern="The exact regex pattern. Use standard regex escaping (e.g., '\\.' for a dot, '\\s' for whitespace).")
-async def add_local_regex(interaction: discord.Interaction, pattern: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-    await add_regex_to_list(interaction, pattern, is_global=False)
-
-@bot.tree.command(name="rm-regex-by-id", description="Removes a regex from the local list by its ID from /list-keywords.")
-@discord.app_commands.describe(index="The numerical ID of the regex pattern to remove.")
-async def remove_local_regex_by_id(interaction: discord.Interaction, index: int):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-    await remove_regex_from_list_by_id(interaction, index, is_global=False)
-
 async def remove_keyword_from_list(interaction: discord.Interaction, keyword: str, primary_key: str, secondary_key: str = None):
     keyword = keyword.lower().strip()
     if not keyword:
@@ -1699,30 +2327,6 @@ async def remove_keyword_from_list(interaction: discord.Interaction, keyword: st
         await interaction.followup.send(f"✅ Keyword '{keyword}' has been removed from this server's local list.")
     else:
         await interaction.followup.send(f"❌ Keyword '{keyword}' was not found in this server's local list.")
-
-@bot.tree.command(name="rm-name-keyword-substring", description="Removes a SUBSTRING keyword from this server's local list.")
-@discord.app_commands.describe(keyword="The exact keyword to remove.")
-async def remove_username_keyword_substring(interaction: discord.Interaction, keyword: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-    await remove_keyword_from_list(interaction, keyword, "username_keywords", "substring")
-
-@bot.tree.command(name="rm-name-keyword-smart", description="Removes a SMART keyword from this server's local list.")
-@discord.app_commands.describe(keyword="The exact keyword to remove.")
-async def remove_username_keyword_smart(interaction: discord.Interaction, keyword: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-    await remove_keyword_from_list(interaction, keyword, "username_keywords", "smart")
-
-@bot.tree.command(name="rm-bio-msg-keyword", description="Removes a keyword from this server's local bio/message list.")
-@discord.app_commands.describe(keyword="The exact keyword or phrase to remove.")
-async def remove_bio_keyword(interaction: discord.Interaction, keyword: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    await interaction.response.defer(ephemeral=True)
-    await remove_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
 
 async def remove_regex_from_list_by_id(interaction: discord.Interaction, index: int, is_global: bool):
     """A helper to remove a regex pattern from the appropriate list by its 1-based index."""
@@ -1753,124 +2357,49 @@ async def remove_regex_from_list_by_id(interaction: discord.Interaction, index: 
     else:
         await interaction.followup.send(f"❌ Invalid ID **`{index}`**. There is no regex pattern with that ID in the {list_name} list. Use `/list-keywords` to see available IDs.")
 
-@bot.tree.command(name="scanallmembers", description="Retroactively scans all server members against the screening list.")
-async def scanallmembers(interaction: discord.Interaction):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    if interaction.guild.id in active_scans:
-        await interaction.response.send_message("❌ A scan is already in progress for this server.", ephemeral=True)
-        return
-    member_count = interaction.guild.member_count
-    view = ConfirmScanView(author=interaction.user)
-    await interaction.response.send_message(f"⚠️ **Are you sure?**\nThis will scan all **{member_count}** members...", view=view, ephemeral=True)
-    await view.wait()
-    if view.value is True:
-        scan_task = bot.loop.create_task(run_full_scan(interaction))
-        active_scans[interaction.guild.id] = scan_task
-    else:
-        await interaction.followup.send("Scan cancelled or timed out.", ephemeral=True)
-
-@bot.tree.command(name="stopscan", description="Stops an ongoing member scan for this server.")
-async def stopscan(interaction: discord.Interaction):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config): return
-    guild_id = interaction.guild.id
-    if guild_id in active_scans:
-        active_scans[guild_id].cancel()
-        logger.info(f"Moderator {interaction.user.name} stopped the scan for guild {guild_id}.")
-        await interaction.response.send_message("✅ Scan cancellation requested.", ephemeral=True)
-    else:
-        await interaction.response.send_message("ℹ️ No scan is currently in progress.", ephemeral=True)
-
-@bot.tree.command(name="contact-maintainer", description="Send a message to the bot maintainer for requests, feedback, or issues.")
-@discord.app_commands.describe(message="Your message, feedback, or request for the bot maintainer.")
-async def contact_maintainer(interaction: discord.Interaction, message: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config):
-        return
-
-    log_channel_id = config.get("log_channel_id")
-    if not log_channel_id:
-        await interaction.response.send_message("❌ The bot's log channel is not configured. Please contact the owner directly.", ephemeral=True)
-        return
-
-    log_channel = bot.get_channel(log_channel_id)
-    if not log_channel:
-        try:
-            log_channel = await bot.fetch_channel(log_channel_id)
-        except (discord.NotFound, discord.Forbidden):
-            await interaction.response.send_message("❌ Could not find or access the bot's log channel. Please contact the owner directly.", ephemeral=True)
-            logger.error(f"Could not fetch log channel {log_channel_id} for contact-admin command.")
+async def update_onboard_command_visibility(guild: discord.Guild):
+    """Hides the /onboard-server command for moderators if the guild is already synced."""
+    try:
+        # Find the /onboard-server command object in the bot's command tree.
+        onboard_command = bot.tree.get_command("onboard-server")
+        if not onboard_command:
+            logger.warning("Could not find the 'onboard-server' command to update its permissions.")
             return
 
-    bot_owner_id = config.get("bot_owner_id")
-    if not bot_owner_id:
-        await interaction.response.send_message("❌ The bot owner's ID is not configured. Cannot send notification.", ephemeral=True)
-        return
+        sync_status = await load_sync_status()
+        
+        if guild.id in sync_status["synced_guild_ids"]:
+            
+            owner_id = bot.config.get("bot_owner_id")
+            if not owner_id:
+                logger.warning(f"Cannot hide /onboard-server in {guild.name} because bot_owner_id is not set.")
+                return
 
-    embed = discord.Embed(
-        title="📬 Contact Request",
-        description=f"A new message has been sent by a moderator.",
-        color=discord.Color.gold(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.add_field(name="📝 Message", value=f"```{message[:1000]}```", inline=False)
-    embed.add_field(name="👤 Sender", value=f"{interaction.user.name} (`{interaction.user.id}`)", inline=True)
-    embed.add_field(name="🌐 Server", value=interaction.guild.name, inline=True)
-    embed.set_footer(text="This is a direct request from a federated moderator.")
+            permissions = {
+                discord.Object(id=owner_id): True
+            }
 
-    try:
-        await log_channel.send(content=f"<@{bot_owner_id}>", embed=embed)
-        await interaction.response.send_message("✅ Your message has been successfully sent to the bot maintainer.", ephemeral=True)
-        logger.info(f"Moderator {interaction.user.name} from {interaction.guild.name} sent an admin contact request.")
+            await bot.tree.edit_command_permissions(guild=guild, command=onboard_command, permissions=permissions)
+            logger.info(f"Hid '/onboard-server' for non-owners in synced guild {guild.name}.")
+        
+        else:
+            mod_role_ids = bot.config.get("moderator_roles_per_guild", {}).get(str(guild.id), [])
+            owner_id = bot.config.get("bot_owner_id")
+
+            permissions = {}
+            for role_id in mod_role_ids:
+                permissions[discord.Object(id=role_id)] = True
+            if owner_id:
+                permissions[discord.Object(id=owner_id)] = True
+            
+            if not permissions:
+                logger.warning(f"No moderator roles configured for {guild.name}, /onboard-server will be hidden.")
+
+            await bot.tree.edit_command_permissions(guild=guild, command=onboard_command, permissions=permissions)
+            logger.info(f"Set visibility for '/onboard-server' for moderators in unsynced guild {guild.name}.")
+
     except Exception as e:
-        await interaction.response.send_message("❌ An error occurred while trying to send your message. Please try again later.", ephemeral=True)
-        logger.error(f"Failed to send contact message to log channel: {e}", exc_info=True)
-
-@bot.tree.command(name="global-ban", description="Proactively bans a user by ID across all federated servers.")
-@discord.app_commands.describe(
-    user_id="The Discord User ID of the person to ban.",
-    reason="The reason for the ban. This will be shown in all federated alerts."
-)
-async def global_ban(interaction: discord.Interaction, user_id: str, reason: str):
-    config = bot.config
-    if not await has_federated_mod_role(interaction, config):
-        return
-
-    if not user_id.isdigit():
-        await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID (numbers only).", ephemeral=True)
-        return
-    
-    target_user_id = int(user_id)
-
-    if target_user_id == interaction.user.id:
-        await interaction.response.send_message("❌ You cannot ban yourself.", ephemeral=True)
-        return
-    
-    if target_user_id == bot.user.id:
-        await interaction.response.send_message("❌ I cannot ban myself.", ephemeral=True)
-        return
-
-    try:
-        user_to_ban = await bot.fetch_user(target_user_id)
-    except discord.NotFound:
-        await interaction.response.send_message(f"❌ **User Not Found:** No user exists with the ID `{target_user_id}`.", ephemeral=True)
-        return
-    except Exception as e:
-        await interaction.response.send_message(f"❌ An error occurred while fetching the user: `{e}`", ephemeral=True)
-        logger.error(f"Failed to fetch user for global-ban command: {e}", exc_info=True)
-        return
-
-    confirm_embed = discord.Embed(
-        title="⚠️ Confirm Global Ban",
-        description=f"You are about to issue a federated ban for the following user. This action cannot be easily undone and will affect **all** federated servers.",
-        color=discord.Color.orange()
-    )
-    confirm_embed.set_author(name=f"{user_to_ban.name} (`{user_to_ban.id}`)", icon_url=user_to_ban.display_avatar.url)
-    confirm_embed.add_field(name="Reason", value=f"```{reason}```", inline=False)
-
-    view = ConfirmGlobalBanView(author=interaction.user, user_to_ban=user_to_ban, reason=reason)
-    await interaction.response.send_message(embed=confirm_embed, view=view, ephemeral=True)
+        logger.error(f"Failed to update visibility for /onboard-server in {guild.name}: {e}", exc_info=True)
 
 # --- MAIN ---
 if __name__ == "__main__":
