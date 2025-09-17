@@ -333,7 +333,7 @@ class ConfirmGlobalBanView(discord.ui.View):
 
         try:
             config = bot.config
-            origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(interaction.guild.id))
+            origin_mod_channel_id = config.get("federation_notice_channels", {}).get(str(interaction.guild.id))
             if origin_mod_channel_id:
                 origin_mod_channel = bot.get_channel(origin_mod_channel_id) or await bot.fetch_channel(origin_mod_channel_id)
                 if origin_mod_channel:
@@ -755,7 +755,7 @@ async def on_member_join(member: discord.Member):
 
     if result.get("flagged"):
         logger.info(f"FLAGGED member on join: {member.name} in {member.guild.name}.")
-        mod_channel_id = config.get("mod_alert_channels", {}).get(str(member.guild.id))
+        mod_channel_id = config.get("action_alert_channels", {}).get(str(member.guild.id))
         alert_channel = member.guild.get_channel(mod_channel_id) if mod_channel_id else None
         
         if alert_channel:
@@ -834,7 +834,7 @@ async def on_message(message: discord.Message):
         except Exception as e:
              logger.error(f"An unexpected error occurred while trying to timeout {author.name}: {e}")
         
-        mod_channel_id = config.get("mod_alert_channels", {}).get(str(message.guild.id))
+        mod_channel_id = config.get("action_alert_channels", {}).get(str(message.guild.id))
         alert_channel = message.guild.get_channel(mod_channel_id) if mod_channel_id else None
         if alert_channel:
             try:
@@ -893,7 +893,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
             alert_message = None
             guild_id_str = str(guild.id)
 
-            primary_channel_id = config.get("mod_alert_channels", {}).get(guild_id_str)
+            primary_channel_id = config.get("action_alert_channels", {}).get(guild_id_str)
             if primary_channel_id:
                 try:
                     channel = bot.get_channel(primary_channel_id) or await bot.fetch_channel(primary_channel_id)
@@ -902,7 +902,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                     alert_message = None # Not found here, will try next channel
 
             if not alert_message:
-                scan_channel_id = config.get("mod_scan_results_channels", {}).get(guild_id_str)
+                scan_channel_id = config.get("action_alert_channels", {}).get(guild_id_str)
                 if scan_channel_id and scan_channel_id != primary_channel_id:
                     try:
                         channel = bot.get_channel(scan_channel_id) or await bot.fetch_channel(scan_channel_id)
@@ -984,7 +984,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     logger.info(f"INITIATING FEDERATED BAN for {user} from origin {guild.name}.")
     
     if authorization_method == "Manual Ban by a whitelisted Moderator":
-        origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(guild.id))
+        origin_mod_channel_id = config.get("federation_notice_channels", {}).get(str(guild.id))
         if origin_mod_channel_id:
             origin_mod_channel = guild.get_channel(origin_mod_channel_id)
             if not origin_mod_channel:
@@ -1037,7 +1037,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
                 if "monthly_received" not in stats[target_guild_id_str]: stats[target_guild_id_str]["monthly_received"] = {}
                 stats[target_guild_id_str]["monthly_received"][current_month_key] = stats[target_guild_id_str]["monthly_received"].get(current_month_key, 0) + 1
 
-                mod_channel_id = config.get("mod_alert_channels", {}).get(str(target_guild.id))
+                mod_channel_id = config.get("federation_notice_channels", {}).get(str(target_guild.id))
                 if mod_channel_id:
                     mod_channel = target_guild.get_channel(mod_channel_id)
                     if not mod_channel:
@@ -1151,7 +1151,7 @@ async def propagate_ban(origin_guild: discord.Guild, user_to_ban: discord.User, 
                 if "monthly_received" not in stats[target_guild_id_str]: stats[target_guild_id_str]["monthly_received"] = {}
                 stats[target_guild_id_str]["monthly_received"][current_month_key] = stats[target_guild_id_str]["monthly_received"].get(current_month_key, 0) + 1
 
-                mod_channel_id = config.get("mod_alert_channels", {}).get(str(target_guild.id))
+                mod_channel_id = config.get("federation_notice_channels", {}).get(str(target_guild.id))
                 if mod_channel_id:
                     mod_channel = target_guild.get_channel(mod_channel_id)
                     if not mod_channel:
@@ -1266,7 +1266,7 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
             await log_channel.send(embed=embed)
 
         logger.info(f"INITIATING FEDERATED (GLOBAL) UNBAN for {user} from origin {guild.name}.")
-        origin_mod_channel_id = config.get("mod_alert_channels", {}).get(str(guild.id))
+        origin_mod_channel_id = config.get("federation_notice_channels", {}).get(str(guild.id))
         if origin_mod_channel_id:
             origin_mod_channel = guild.get_channel(origin_mod_channel_id)
             if not origin_mod_channel:
@@ -1306,7 +1306,7 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
                         if "monthly_received" in stats[target_guild_id_str] and current_month_key in stats[target_guild_id_str]["monthly_received"]:
                             stats[target_guild_id_str]["monthly_received"][current_month_key] = max(0, stats[target_guild_id_str]["monthly_received"].get(current_month_key, 0) - 1)
                     
-                    mod_channel_id = config.get("mod_alert_channels", {}).get(str(target_guild.id))
+                    mod_channel_id = config.get("federation_notice_channels", {}).get(str(target_guild.id))
                     if mod_channel_id:
                         mod_channel = target_guild.get_channel(mod_channel_id)
                         if not mod_channel:
@@ -1563,7 +1563,7 @@ async def run_full_scan(interaction: discord.Interaction):
     config = bot.config
     guild = interaction.guild
     
-    results_channel_id = config.get("mod_scan_results_channels", {}).get(str(guild.id))
+    results_channel_id = config.get("action_alert_channels", {}).get(str(guild.id))
     results_channel = guild.get_channel(results_channel_id)
 
     if not results_channel:
