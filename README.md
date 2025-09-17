@@ -1,25 +1,34 @@
-## Discord Defi Antiscam
-Inspired by [danijelthales](https://github.com/danijelthales) antiscam bot.
+# Discord Defi Antiscam Bot
 
-🛡️ **Federated Bans**: Bans in one server are instantly propagated to all others.
+A federated antiscam bot to proactively protect DeFi and crypto communities. Inspired by the work of [danijelthales](https://github.com/danijelthales).
 
-🤖 **Automatic Screening**: Scans new users on joining for names, bios, and federated ban status.
+## Core Features
 
-🔎 **Real-time Message Scanning**: Deletes scam messages and times out offenders.
+🛡️ **Federated Network**: A ban in one server is instantly propagated to all others. New servers can be onboarded to receive the entire historical collective ban list, providing immediate protection.
 
-ℹ️ **Interactive Alerts**: Rich alerts with buttons (Ban, Kick, Unban, Ignore) for fast action.
+🤖 **Automatic Screening**:
+- **On Join**: Scans usernames, bios, and cross-references against the global federated ban list.
+- **On Message**: Scans message content for malicious links and keywords. Also performs periodic, cached checks of user bios to catch dormant threats.
 
-⚖️ **Local Control**: Override a federated ban for your server locally.
+🔎 **Proactive & Reactive**:
+- **Real-time Actions**: Instantly deletes scam messages and times out offenders.
+- **Proactive Bans**: Moderators can issue a global ban by User ID *before* a known scammer joins any server.
+- **Retroactive Scanning**: A slash command to find threats already inside your server.
 
-⚙️ **Keyword & Regex Matching**: Manage keyword lists and regex patterns with slash commands.
+⚙️ **Advanced Toolkit**:
+- **Interactive Alerts**: Alerts with buttons (Ban, Kick, Unban, Ignore) for quick response.
+- **Local Control**: Moderators can locally override a federated ban for their specific community.
+- **Keyword & Regex Management**: Add and remove keywords and complex regex patterns with slash commands.
+- **Federation Stats**: Track bans initiated and received across the network, with federation total.
+- **Maintainer Contact**: A slash command for a direct feedback channel to the bot owner.
 
-🧹 **Retroactive Scanning**: Scan all existing server members for dormant threats.
+## Join the Federation
 
-📊 **Federation Stats**: Track bans initiated and received across the network.
+Protect your community by leveraging the collective experience of trusted DeFi projects. By joining, you reduce workload, automate threat removal, and stop scammers before they can act.
 
-Find me on [Yearn Discord](https://discord.gg/yearn) or [X](https://x.com/JxyHelper) to join the federation. You gain the collective experience of trusted member communities, reducing moderator workload and stopping threats before they can act.
+Find me on the [Yearn Discord](https://discord.gg/yearn) or on [X](https://x.com/JxyHelper) to get your server onboarded.
 
-## Current Servers
+### Current Federated Servers
 - Yearn
 - BMX
 - Alchemix
