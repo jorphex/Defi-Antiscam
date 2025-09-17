@@ -513,6 +513,68 @@ class OnboardView(discord.ui.View):
             item.disabled = True
         await interaction.response.edit_message(content="Onboarding cancelled.", view=self, embed=None)
 
+class LookupPaginatorView(discord.ui.View):
+    def __init__(self, author: discord.User, query: str, results: list):
+        super().__init__(timeout=300.0)
+        self.author = author
+        self.query = query
+        self.results = results
+        
+        self.current_page = 0
+        self.items_per_page = 5
+        self.total_pages = (len(self.results) - 1) // self.items_per_page + 1
+
+        mentioned_users = [discord.Object(id=int(user_id)) for user_id, data in self.results]
+        self.allowed = discord.AllowedMentions(users=mentioned_users)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("You are not the one who initiated this command.", ephemeral=True)
+            return False
+        return True
+
+    def create_embed(self) -> discord.Embed:
+        """Creates the embed for the current page."""
+        start_index = self.current_page * self.items_per_page
+        end_index = start_index + self.items_per_page
+        page_results = self.results[start_index:end_index]
+
+        embed = discord.Embed(
+            title=f"Ban List Search Results for \"{self.query}\"",
+            description=f"Found **{len(self.results)}** matching record(s).",
+            color=discord.Color.blue()
+        )
+
+        page_content = []
+        for user_id, data in page_results:
+            entry = (
+                f"**Username:** {data.get('username_at_ban', 'N/A')}\n"
+                f"**User ID:** `{user_id}`\n"
+                f"**Origin:** {data.get('origin_guild_name', 'N/A')}\n"
+                f"**Reason:** {data.get('reason', 'N/A')}"
+            )
+            page_content.append(entry)
+        
+        embed.description += "\n\n" + "\n--------------------\n".join(page_content)
+        embed.set_footer(text=f"Page {self.current_page + 1} of {self.total_pages}")
+        
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page >= self.total_pages - 1
+        
+        return embed
+
+    @discord.ui.button(label="◄ Previous", style=discord.ButtonStyle.secondary, custom_id="lookup_prev")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            await interaction.response.edit_message(embed=self.create_embed(), view=self, allowed_mentions=self.allowed)
+
+    @discord.ui.button(label="Next ►", style=discord.ButtonStyle.secondary, custom_id="lookup_next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            await interaction.response.edit_message(embed=self.create_embed(), view=self, allowed_mentions=self.allowed)
+
 # --- BOT SETUP ---
 intents = discord.Intents.default()
 intents.guilds = True
@@ -2135,6 +2197,46 @@ async def global_ban(interaction: discord.Interaction, user_id: str, reason: str
 
     view = ConfirmGlobalBanView(author=interaction.user, user_to_ban=user_to_ban, reason=reason)
     await interaction.response.send_message(embed=confirm_embed, view=view, ephemeral=True)
+
+@bot.tree.command(name="lookup", description="Looks up a user ID or username in the federated ban list.")
+@discord.app_commands.describe(query="The User ID or username to search for.")
+@has_mod_role()
+async def lookup(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+
+    fed_bans = await load_fed_bans()
+    if not fed_bans:
+        await interaction.followup.send("The federated ban list is currently empty.", ephemeral=True)
+        return
+
+    query = query.strip()
+    results = []
+
+    if query.isdigit():
+        # --- ID Search (Exact Match) ---
+        user_id_str = query
+        if user_id_str in fed_bans:
+            results.append((user_id_str, fed_bans[user_id_str]))
+    else:
+        # --- Username Search (Case-insensitive, Partial Match) ---
+        query_lower = query.lower()
+        for user_id, data in fed_bans.items():
+            username = data.get("username_at_ban", "").lower()
+            if query_lower in username:
+                results.append((user_id, data))
+
+    if not results:
+        await interaction.followup.send(f"No records found matching your query: `{query}`", ephemeral=True)
+        return
+
+    mentioned_users = [discord.Object(id=int(user_id)) for user_id, data in results]
+    allowed = discord.AllowedMentions(users=mentioned_users)
+
+    view = LookupPaginatorView(author=interaction.user, query=query, results=results)
+    initial_embed = view.create_embed()
+    
+    await interaction.followup.send(embed=initial_embed, view=view, allowed_mentions=allowed)
+
 
 
 # --- COMMAND HELPERS ---
