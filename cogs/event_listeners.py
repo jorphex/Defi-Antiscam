@@ -1,0 +1,609 @@
+# /antiscam/cogs/event_listeners.py
+
+import discord
+from discord.ext import commands
+import asyncio
+from datetime import timedelta, datetime, timezone
+import re
+from typing import TYPE_CHECKING
+
+import data_manager
+import llm_handler
+import screening_handler
+from config import logger
+from ui.views import ScreeningView, FederatedAlertView
+from screening_handler import get_delete_days_for_guild
+
+if TYPE_CHECKING:
+    from antiscam import AntiScamBot
+
+class EventListeners(commands.Cog):
+    def __init__(self, bot: 'AntiScamBot'):
+        self.bot = bot
+        self.gemini_is_available = False
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        logger.info(f'{self.bot.user.name} has connected to Discord!')
+
+        self.gemini_is_available = llm_handler.initialize_gemini()
+        if self.gemini_is_available:
+            logger.info("Gemini client initialized successfully.")
+
+        logger.info(f"Operating in {len(self.bot.guilds)} federated guilds.")
+        self.bot.add_view(ScreeningView(flagged_member_id=None))
+        self.bot.add_view(FederatedAlertView(banned_user_id=None))
+
+        keywords_data = await data_manager.load_keywords()
+        if keywords_data:
+            self.bot.suspicious_identity_tags = keywords_data.get("global_keywords", {}).get("suspicious_identity_tags", [])
+        
+        logger.info(f"Loaded {len(self.bot.suspicious_identity_tags)} suspicious identity tags.")
+        logger.info(f"Loaded {len(self.bot.scam_server_ids)} known scam server IDs.")
+
+        if not self.bot._has_synced_once:
+            try:
+                logger.info("Performing one-time command sync...")
+                synced = await self.bot.tree.sync()
+                logger.info(f"Synced {len(synced)} command(s) globally.")
+                self.bot._has_synced_once = True
+            except Exception as e:
+                logger.error(f"Failed to perform one-time sync: {e}", exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild):
+        logger.info(f"Joined new guild: {guild.name} ({guild.id}). Setting up command permissions.")
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        config = self.bot.config
+        bot_owner_id = config.get("bot_owner_id")
+        if bot_owner_id and member.id == bot_owner_id:
+            logger.info(f"Bot owner ({member.name}) joined {member.guild.name}. Skipping screening.")
+            return
+
+        if member.guild.id not in config.get("federated_guild_ids", []): return
+    
+        await asyncio.sleep(2)
+        try:
+            member = await member.guild.fetch_member(member.id)
+        except discord.NotFound:
+            logger.warning(f"Member {member.name} left before they could be processed.")
+            return
+
+        whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(member.guild.id), [])
+        if any(role.id in whitelisted_roles for role in member.roles):
+            logger.info(f"Member {member.name} has a whitelisted role. Skipping screen.")
+            return
+
+        keywords_data = await data_manager.load_keywords()
+        if not keywords_data:
+            logger.error("Could not load keywords for on_member_join screen. Aborting check.")
+            return
+
+        result = await screening_handler.screen_member(self.bot, member, keywords_data)
+
+        if result.get("flagged"):
+            logger.info(f"FLAGGED member on join: {member.name} in {member.guild.name}.")
+            mod_channel_id = config.get("action_alert_channels", {}).get(str(member.guild.id))
+            alert_channel = member.guild.get_channel(mod_channel_id) if mod_channel_id else None
+        
+            if alert_channel:
+                try:
+                    timeout_minutes = screening_handler.get_timeout_minutes_for_guild(self.bot, member.guild)
+                    await member.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason"))
+                
+                    view = ScreeningView(flagged_member_id=member.id)
+                    embed = result.get("embed")
+                    embed.set_footer(text=f"User ID: {member.id}")
+
+                    guild_id_str = str(member.guild.id)
+                    llm_defaults = config.get("llm_settings", {}).get("defaults", {})
+                    llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
+
+                    if self.gemini_is_available and llm_config.get("automation_mode", "off") != "off":
+                        bio = getattr(await self.bot.fetch_user(member.id), 'bio', "")
+                        self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
+                            bot=self.bot,
+                            alert_channel=alert_channel,
+                            embed=embed,
+                            view=view,
+                            flagged_member=member,
+                            content_type="Bio/Username",
+                            content=f"Username: {member.name}\nNick: {member.nick}\nBio: {bio}",
+                            trigger=result.get("timeout_reason")
+                        ))
+                    else:
+                        allowed_mentions = discord.AllowedMentions(users=[member])
+                        await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
+
+                except Exception as e:
+                    logger.error(f"Failed to take action on flagged member {member.name}: {e}", exc_info=True)
+        elif not result:
+            logger.info(f"Member {member.name} in {member.guild.name} flagged as 'Banned Elsewhere'. Automated action is pending.")
+        else:
+            logger.info(f"Member {member.name} in {member.guild.name} passed all screenings.")
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or message.author == self.bot.user:
+            return
+        
+        config = self.bot.config
+        bot_owner_id = config.get("bot_owner_id")
+        if bot_owner_id and message.author.id == bot_owner_id:
+            return
+    
+        if not message.guild or message.guild.id not in config.get("federated_guild_ids", []): return
+        if not isinstance(message.author, discord.Member): return
+    
+        whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(message.guild.id), [])
+        if any(role.id in whitelisted_roles for role in message.author.roles): return
+
+        keywords_data = await data_manager.load_keywords()
+        if not keywords_data: return
+
+        result = await screening_handler.screen_message(message, keywords_data)
+
+        if not result.get("flagged"):
+            author_id = message.author.id
+            current_time = datetime.now(timezone.utc)
+        
+            if author_id in self.bot.bio_check_cache:
+                last_checked = self.bot.bio_check_cache[author_id]
+                if (current_time - last_checked).total_seconds() < 300:
+                    return
+
+            bio_result = await screening_handler.screen_bio(self.bot, message.author, keywords_data)
+            self.bot.bio_check_cache[author_id] = current_time
+
+            if bio_result.get("flagged"):
+                embed = bio_result.get("embed")
+                embed.description = (
+                    f"**User:** {message.author.mention} (`{message.author.id}`)\n"
+                    f"This user sent a valid message in {message.channel.mention}, but their bio was flagged upon inspection."
+                )
+                result = bio_result
+
+        if result.get("flagged"):
+            author = message.author
+            logger.info(f"FLAGGED event for {author.name} in #{message.channel.name} (Trigger: {'Bio' if 'Bio' in result['embed'].title else 'Message'}).")
+        
+            if "Message" in result["embed"].title:
+                try: await message.delete()
+                except Exception as e: logger.error(f"Error deleting flagged message: {e}")
+        
+            try:
+                timeout_minutes = screening_handler.get_timeout_minutes_for_guild(self.bot, author.guild)
+                await author.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason", "Flagged content."))
+            except discord.HTTPException as e:
+                if e.code == 40007:
+                    logger.warning(f"Could not timeout {author.name} because they have already left the server.")
+                else:
+                    logger.error(f"Failed to timeout {author.name}: {e}")
+            except Exception as e:
+                 logger.error(f"An unexpected error occurred while trying to timeout {author.name}: {e}")
+        
+            mod_channel_id = config.get("action_alert_channels", {}).get(str(message.guild.id))
+            alert_channel = message.guild.get_channel(mod_channel_id) if mod_channel_id else None
+            if alert_channel:
+                try:
+                    view = ScreeningView(flagged_member_id=author.id)
+                    embed = result.get("embed")
+                    embed.set_footer(text=f"User ID: {author.id}")
+
+                    guild_id_str = str(message.guild.id)
+                    llm_defaults = config.get("llm_settings", {}).get("defaults", {})
+                    llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
+
+                    if self.gemini_is_available and llm_config.get("automation_mode", "off") != "off":
+                        content_type = "Message"
+                        content = message.content
+                        if "Bio" in embed.title:
+                            content_type = "Bio"
+                            bio = getattr(await self.bot.fetch_user(author.id), 'bio', "")
+                            content = bio
+
+                        self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
+                            bot=self.bot,
+                            alert_channel=alert_channel,
+                            embed=embed,
+                            view=view,
+                            flagged_member=author,
+                            content_type=content_type,
+                            content=content,
+                            trigger=result.get("timeout_reason")
+                        ))
+                    else:
+                        allowed_mentions = discord.AllowedMentions(users=[author])
+                        await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
+                except Exception as e:
+                    logger.error(f"Failed to send alert for {author.name}: {e}", exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild: discord.Guild, user: discord.User):
+        config = self.bot.config
+        if guild.id not in config.get("federated_guild_ids", []): return
+    
+        stats = await data_manager.load_fed_stats()
+        current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+        
+        moderator, ban_reason = None, "No reason provided."
+        await asyncio.sleep(2)
+
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=5):
+                if entry.target.id == user.id:
+                    moderator, ban_reason = entry.user, entry.reason or "No reason provided."
+                    break
+        except Exception as e:
+            logger.error(f"Error fetching audit logs in {guild.name}: {e}", exc_info=True)
+            return
+        
+        if not moderator:
+            logger.info(f"Ban of {user} in {guild.name} could not be attributed. No federated action.")
+            return
+    
+        if "Federated ban sync" in ban_reason or "Proactive ban initiated by" in ban_reason or ban_reason.startswith("Federated ban from"):
+            logger.info(f"Ignoring automated/echo ban event for {user.name}.")
+            return
+
+        is_authorized, authorization_method = False, "Unknown"
+        detailed_reason_field = None
+
+        if moderator.id == self.bot.user.id:
+            alert_id_match = re.search(r"AlertID:(\d+)", ban_reason)
+            if alert_id_match:
+                is_authorized, authorization_method = True, "Authorized via Bot Alert"
+                alert_message_id = int(alert_id_match.group(1))
+                alert_message = None
+                guild_id_str = str(guild.id)
+
+                primary_channel_id = config.get("action_alert_channels", {}).get(guild_id_str)
+                if primary_channel_id:
+                    try:
+                        channel = self.bot.get_channel(primary_channel_id) or await self.bot.fetch_channel(primary_channel_id)
+                        alert_message = await channel.fetch_message(alert_message_id)
+                    except (discord.NotFound, discord.Forbidden):
+                        alert_message = None # Not found here, will try next channel
+
+                if not alert_message:
+                    scan_channel_id = config.get("action_alert_channels", {}).get(guild_id_str)
+                    if scan_channel_id and scan_channel_id != primary_channel_id:
+                        try:
+                            channel = self.bot.get_channel(scan_channel_id) or await self.bot.fetch_channel(scan_channel_id)
+                            alert_message = await channel.fetch_message(alert_message_id)
+                        except (discord.NotFound, discord.Forbidden):
+                            alert_message = None # Not found here either
+                        
+                if alert_message and alert_message.embeds:
+                    original_embed = alert_message.embeds[0]
+                    for field in original_embed.fields:
+                        if "Message" in field.name or "Bio" in field.name or "Banned In" in field.name:
+                            detailed_reason_field = {"name": f"Original {field.name}", "value": field.value}
+                            break
+                    if not detailed_reason_field:
+                         for field in original_embed.fields:
+                            if "Trigger" in field.name:
+                                detailed_reason_field = {"name": "Original Trigger", "value": field.value}
+                                break
+
+                else:
+                    config.logger.warning(f"Could not fetch original alert message {alert_message_id} in any configured channel for guild {guild.name}.")
+        
+        elif not moderator.bot:
+            if isinstance(moderator, discord.Member):
+                whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(guild.id), [])
+                if any(role.id in whitelisted_mod_roles for role in moderator.roles):
+                    fed_bans = await data_manager.load_fed_bans()
+                    if str(user.id) in fed_bans:
+                        config.logger.info(f"Ignoring manual ban of {user.name} in {guild.name} as they are already on the master ban list.")
+                        notice_channel_id = config.get("federation_notice_channels", {}).get(str(guild.id))
+                        if notice_channel_id:
+                            channel = guild.get_channel(notice_channel_id)
+                            if channel:
+                                await channel.send(f"ℹ️ The manual ban of **{user.name}** was not propagated as they are already on the federated ban list.")
+                        return
+
+                    is_authorized = True
+                    authorization_method = "Manual Ban by a whitelisted Moderator"
+                else:
+                    config.logger.warning(f"User {user} was banned by {moderator}, but they do not have a whitelisted role.")
+                    return
+            else:
+                config.logger.warning(f"User {user} was banned by {moderator} who is no longer in the server. Cannot verify roles.")
+                return
+        else:
+            config.logger.info(f"Ban of {user} in {guild.name} was by an unauthorized bot ({moderator.name}).")
+            return
+    
+        if not is_authorized:
+            config.logger.warning(f"Ban of {user} by {moderator} did not pass authorization checks.")
+            return
+    
+        guild_id_str = str(guild.id)
+        if guild_id_str not in stats: stats[guild_id_str] = {}
+        stats[guild_id_str]["bans_initiated_lifetime"] = stats[guild_id_str].get("bans_initiated_lifetime", 0) + 1
+        if "monthly_initiated" not in stats[guild_id_str]: stats[guild_id_str]["monthly_initiated"] = {}
+        stats[guild_id_str]["monthly_initiated"][current_month_key] = stats[guild_id_str]["monthly_initiated"].get(current_month_key, 0) + 1
+
+        display_reason = ""
+        if not detailed_reason_field:
+            default_reason = config.get("manual_ban_default_reason", "Scam")
+            display_reason = ban_reason if ban_reason != "No reason provided." else default_reason
+            detailed_reason_field = {"name": "Ban Reason", "value": f"```{display_reason[:1000]}```"}
+        else:
+            display_reason = detailed_reason_field["value"].strip("`")
+    
+        fed_bans = await data_manager.load_fed_bans()
+    
+        fed_bans[str(user.id)] = {
+            "username_at_ban": user.name,
+            "ban_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "origin_guild_id": guild.id,
+            "origin_guild_name": guild.name,
+            "reason": display_reason,
+            "initiating_moderator_id": moderator.id
+        }
+        await data_manager.save_fed_bans(fed_bans)
+
+        if "global" not in stats: stats["global"] = {}
+        stats["global"]["total_federated_actions_lifetime"] = stats["global"].get("total_federated_actions_lifetime", 0) + 1
+    
+        log_channel_id = config.get("log_channel_id")
+        log_channel = self.bot.get_channel(log_channel_id) if log_channel_id else None
+        if log_channel:
+            embed = discord.Embed(title="🛡️ Federated Ban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Origin:** {guild.name}\n**Authorization:** {authorization_method}\n**Reason:** ```{ban_reason[:1000]}```", color=discord.Color.brand_red(), timestamp=datetime.now(timezone.utc))
+            embed.set_author(name=user.name, icon_url=user.display_avatar.url)
+            await log_channel.send(embed=embed)
+        
+        config.logger.info(f"INITIATING FEDERATED BAN for {user} from origin {guild.name}.")
+    
+        if authorization_method == "Manual Ban by a whitelisted Moderator":
+            origin_mod_channel_id = config.get("federation_notice_channels", {}).get(str(guild.id))
+            if origin_mod_channel_id:
+                origin_mod_channel = guild.get_channel(origin_mod_channel_id)
+                if not origin_mod_channel:
+                    try:
+                        origin_mod_channel = await self.bot.fetch_channel(origin_mod_channel_id)
+                    except (discord.NotFound, discord.Forbidden):
+                        config.logger.warning(f"Could not find or access origin mod channel {origin_mod_channel_id}")
+                        origin_mod_channel = None
+
+                if origin_mod_channel:
+                    embed_desc = (
+                        f"The manual ban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.\n\n"
+                        f"**Reason:**\n```{display_reason[:1000]}```"
+                    )
+                    origin_alert_embed = discord.Embed(
+                        title="✅ Manual Ban Propagated", 
+                        description=embed_desc, 
+                        color=discord.Color.blue(), 
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    allowed_mentions = discord.AllowedMentions(users=[user])
+                    await origin_mod_channel.send(embed=origin_alert_embed, allowed_mentions=allowed_mentions)
+
+        for guild_id in config.get("federated_guild_ids", []):
+            if guild_id == guild.id: continue
+            target_guild = self.bot.get_guild(guild_id)
+            if not target_guild: continue
+            bot_member = target_guild.me
+            if not bot_member.guild_permissions.ban_members:
+                config.logger.warning(f"Missing 'Ban Members' permission in {target_guild.name}. Skipping federated ban.")
+                if log_channel: await log_channel.send(f"⚠️ Failed to ban `{user}` in `{target_guild.name}` - Missing Permissions.")
+                continue
+            try:
+                await target_guild.fetch_ban(user)
+                config.logger.info(f"User {user} is already banned in {target_guild.name}.")
+            except discord.NotFound:
+                try:
+                    fed_reason = f"Federated ban from {guild.name}. Reason: {ban_reason}"
+
+                    delete_days = get_delete_days_for_guild(target_guild)
+                    delete_seconds = delete_days * 86400 # 24h * 60m * 60s
+
+                    await target_guild.ban(user, reason=fed_reason[:512], delete_message_seconds=delete_seconds)
+                    config.logger.info(f"SUCCESS: Banned {user} from {target_guild.name}.")
+                    if log_channel: await log_channel.send(f"✅ Banned `{user}` in `{target_guild.name}`.")
+                
+                    target_guild_id_str = str(target_guild.id)
+                    if target_guild_id_str not in stats: stats[target_guild_id_str] = {}
+                    stats[target_guild_id_str]["bans_received_lifetime"] = stats[target_guild_id_str].get("bans_received_lifetime", 0) + 1
+                    if "monthly_received" not in stats[target_guild_id_str]: stats[target_guild_id_str]["monthly_received"] = {}
+                    stats[target_guild_id_str]["monthly_received"][current_month_key] = stats[target_guild_id_str]["monthly_received"].get(current_month_key, 0) + 1
+
+                    mod_channel_id = config.get("federation_notice_channels", {}).get(str(target_guild.id))
+                    if mod_channel_id:
+                        mod_channel = target_guild.get_channel(mod_channel_id)
+                        if not mod_channel:
+                            try:
+                                mod_channel = await self.bot.fetch_channel(mod_channel_id)
+                            except (discord.NotFound, discord.Forbidden):
+                                config.logger.warning(f"Could not find or access mod channel {mod_channel_id} in {target_guild.name}")
+                                mod_channel = None
+
+                        if mod_channel:
+                            alert_embed = discord.Embed(
+                                title="🛡️ Federated Ban Received",
+                                description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n"
+                                            f"**Action:** Automatically banned from this server.\n"
+                                            f"**Origin:** **{guild.name}**",
+                                color=discord.Color.dark_red(),
+                                timestamp=datetime.now(timezone.utc)
+                            )
+                            alert_embed.add_field(
+                                name=detailed_reason_field["name"],
+                                value=detailed_reason_field["value"],
+                                inline=False
+                            )
+                            alert_embed.set_author(name=user.name, icon_url=user.display_avatar.url)
+                        
+                            view = FederatedAlertView(banned_user_id=user.id)
+                        
+                            allowed_mentions = discord.AllowedMentions(users=[user])
+                            await mod_channel.send(embed=alert_embed, view=view, allowed_mentions=allowed_mentions)
+
+                except Exception as e:
+                    config.logger.error(f"Error during federated ban propagation to {target_guild.name}: {e}", exc_info=True)
+                    if log_channel: await log_channel.send(f"❌ Failed to ban `{user}` in `{target_guild.name}` - Error: `{e}`")
+    
+        await data_manager.save_fed_stats(stats)
+
+    @commands.Cog.listener()
+    async def on_member_unban(self, guild: discord.Guild, user: discord.User):
+        config = self.bot.config
+        if guild.id not in config.get("federated_guild_ids", []): return
+
+        moderator, unban_reason = None, "No reason provided."
+        await asyncio.sleep(2)
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.unban, limit=5):
+                if entry.target.id == user.id:
+                    moderator, unban_reason = entry.user, entry.reason or "No reason provided."
+                    break
+        except Exception as e:
+            config.logger.error(f"Error fetching audit logs for unban in {guild.name}: {e}", exc_info=True)
+            return
+
+        if not moderator:
+            config.logger.info(f"Unban of {user} in {guild.name} could not be attributed.")
+            return
+
+        is_authorized, authorization_method = False, "Unknown"
+        should_propagate = False # Default to local action
+
+        if unban_reason.startswith("[Local Action]"):
+            config.logger.info(f"Processing local-only unban for {user} in {guild.name}.")
+            is_authorized = True
+            authorization_method = "Local Unban via Federated Alert"
+            should_propagate = False
+        elif moderator.id == self.bot.user.id:
+            if unban_reason.startswith("[Federated Action]"):
+                is_authorized, authorization_method = True, "Authorized via Bot Alert"
+                should_propagate = True # This is a global action
+            else:
+                config.logger.info(f"Ignoring federated unban echo for {user} in {guild.name}.")
+                return
+        elif not moderator.bot:
+            if isinstance(moderator, discord.Member):
+                whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(guild.id), [])
+                if any(role.id in whitelisted_mod_roles for role in moderator.roles):
+                    is_authorized, authorization_method = True, "Manual Unban by a whitelisted Moderator"
+                    should_propagate = True
+                else:
+                    config.logger.warning(f"User {user} was unbanned by {moderator}, but they do not have a whitelisted role.")
+                    return
+            else:
+                config.logger.warning(f"User {user} was unbanned by {moderator} who is no longer in the server. Cannot verify roles.")
+                return
+        else:
+            config.logger.info(f"Unban of {user} in {guild.name} was by an unauthorized bot ({moderator.name}).")
+            return
+
+        if not is_authorized:
+            config.logger.warning(f"Unban of {user} by {moderator} did not pass authorization checks.")
+            return
+
+        stats = await data_manager.load_fed_stats()
+        current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+
+        if "global" not in stats: stats["global"] = {}
+        stats["global"]["total_federated_actions_lifetime"] = max(0, stats["global"].get("total_federated_actions_lifetime", 0) - 1)
+    
+        # Only enter the propagation block if it's a global action.
+        if should_propagate:
+            fed_bans = await data_manager.load_fed_bans()
+            user_id_str = str(user.id)
+            if user_id_str in fed_bans:
+                del fed_bans[user_id_str]
+                await data_manager.save_fed_bans(fed_bans)
+                config.logger.info(f"Removed user {user.id} from the master federated ban list.")
+            
+            log_channel_id = config.get("log_channel_id")
+            log_channel = self.bot.get_channel(log_channel_id) if log_channel_id else None
+            if log_channel:
+                embed = discord.Embed(title="ℹ️ Federated Unban", description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n**Origin:** {guild.name}\n**Authorization:** {authorization_method}", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
+                embed.set_author(name=user.name, icon_url=user.display_avatar.url)
+                await log_channel.send(embed=embed)
+
+            config.logger.info(f"INITIATING FEDERATED (GLOBAL) UNBAN for {user} from origin {guild.name}.")
+            origin_mod_channel_id = config.get("federation_notice_channels", {}).get(str(guild.id))
+            if origin_mod_channel_id:
+                origin_mod_channel = guild.get_channel(origin_mod_channel_id)
+                if not origin_mod_channel:
+                    try:
+                        origin_mod_channel = await self.bot.fetch_channel(origin_mod_channel_id)
+                    except (discord.NotFound, discord.Forbidden):
+                        config.logger.warning(f"Could not find or access origin mod channel {origin_mod_channel_id}")
+                        origin_mod_channel = None
+
+                if origin_mod_channel:
+                    embed_desc = (
+                        f"The unban for **{user.name}** (`{user.id}`) has been broadcast to all federated servers.\n\n"
+                        f"**Reason:**\n```{unban_reason[:1000]}```"
+                    )
+                    origin_alert_embed = discord.Embed(
+                        title="✅ Global Unban Propagated", 
+                        description=embed_desc, 
+                        color=discord.Color.light_grey(), 
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    await origin_mod_channel.send(embed=origin_alert_embed)
+
+            for guild_id in config.get("federated_guild_ids", []):
+                if guild_id == guild.id: continue
+                target_guild = self.bot.get_guild(guild_id)
+                if not target_guild: continue
+                try:
+                    await target_guild.fetch_ban(user)
+                    try:
+                        await target_guild.unban(user, reason=f"Federated unban from {guild.name}.")
+                        config.logger.info(f"SUCCESS: Unbanned {user} from {target_guild.name}.")
+                        if log_channel: await log_channel.send(f"✅ Unbanned `{user}` in `{target_guild.name}`.")
+                    
+                        target_guild_id_str = str(target_guild.id)
+                        if target_guild_id_str in stats:
+                            stats[target_guild_id_str]["bans_received_lifetime"] = max(0, stats[target_guild_id_str].get("bans_received_lifetime", 0) - 1)
+                            if "monthly_received" in stats[target_guild_id_str] and current_month_key in stats[target_guild_id_str]["monthly_received"]:
+                                stats[target_guild_id_str]["monthly_received"][current_month_key] = max(0, stats[target_guild_id_str]["monthly_received"].get(current_month_key, 0) - 1)
+                    
+                        mod_channel_id = config.get("federation_notice_channels", {}).get(str(target_guild.id))
+                        if mod_channel_id:
+                            mod_channel = target_guild.get_channel(mod_channel_id)
+                            if not mod_channel:
+                                try:
+                                    mod_channel = await self.bot.fetch_channel(mod_channel_id)
+                                except (discord.NotFound, discord.Forbidden):
+                                    config.logger.warning(f"Could not find or access mod channel {mod_channel_id} in {target_guild.name}")
+                                    mod_channel = None
+
+                            if mod_channel:
+                                alert_embed = discord.Embed(
+                                    title="ℹ️ Federated Unban Received", 
+                                    description=f"**User:** {user.name} ({user.mention}, `{user.id}`)\n"
+                                                f"**Action:** Automatically unbanned from this server.\n"
+                                                f"**Origin:** **{guild.name}**", 
+                                    color=discord.Color.green(), 
+                                    timestamp=datetime.now(timezone.utc)
+                                )
+                                alert_embed.add_field(
+                                    name="Reason from Origin Server",
+                                    value=f"```{unban_reason[:1000]}```",
+                                    inline=False
+                                )
+                                alert_embed.set_author(name=user.name, icon_url=user.display_avatar.url)
+                            
+                                allowed_mentions = discord.AllowedMentions(users=[user])
+                                await mod_channel.send(embed=alert_embed, allowed_mentions=allowed_mentions)
+                    except Exception as e:
+                        config.logger.error(f"Error during federated unban propagation to {target_guild.name}: {e}", exc_info=True)
+                        if log_channel: await log_channel.send(f"❌ Failed to unban `{user}` in `{target_guild.name}` - Error: `{e}`")
+                except discord.NotFound:
+                    config.logger.info(f"User {user} was not banned in {target_guild.name}. No unban action needed.")
+                    continue
+    
+        await data_manager.save_fed_stats(stats)
+        
+async def setup(bot):
+    await bot.add_cog(EventListeners(bot))
