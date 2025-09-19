@@ -1,4 +1,5 @@
-# llm_handler.py
+# /antiscam/llm_handler.py
+
 import google.genai as genai
 from google.genai import types
 import os
@@ -7,47 +8,37 @@ import enum
 from pydantic import BaseModel
 import discord
 import asyncio
-from datetime import datetime, timezone
-from typing import Optional, TYPE_CHECKING # <--- CHANGE 1: Import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
-# vvv CHANGE 2: Add the TYPE_CHECKING block for the IDE vvv
+from config import logger
+from ui.views import ScreeningView
+from screening_handler import get_delete_days_for_guild
+
 if TYPE_CHECKING:
-    # This import is only seen by the type checker, not at runtime.
-    # It allows the IDE to understand what 'AntiScamBot' is.
     from antiscam import AntiScamBot
-
-logger = logging.getLogger('discord')
-
-
-
 
 # --- Pydantic Models for Structured Output ---
 class Verdict(str, enum.Enum):
-    """Enumeration for the classification of the content."""
     MALICIOUS = "MALICIOUS"
     SUSPICIOUS = "SUSPICIOUS"
     SAFE = "SAFE"
 
 class AnalysisResult(BaseModel):
-    """Structured response from the LLM analysis."""
     verdict: Verdict
     reason: str
 
-# --- Gemini Client Initialization ---
+# --- Gemini Client ---
 def initialize_gemini():
     """Initializes the Gemini client using the API key from environment variables."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         logger.warning("GEMINI_API_KEY not found in environment variables. LLM features will be disabled.")
         return False
-    # The client automatically picks up the key from the environment variable
-    # No need to pass it explicitly if GEMINI_API_KEY is set
     return True
 
 async def get_llm_verdict(bot: 'AntiScamBot', member: discord.Member, content_type: str, content: str, trigger: str) -> Optional[AnalysisResult]:
     """
-    Analyzes content using the Gemini API with a separate system prompt
-    and returns a structured verdict.
+    Analyzes content using the Gemini API and returns a structured verdict.
     """
     try:
         client = genai.Client()
@@ -87,16 +78,10 @@ async def get_llm_verdict(bot: 'AntiScamBot', member: discord.Member, content_ty
         logger.error(f"An error occurred during Gemini API call for {member.name}: {e}", exc_info=True)
         return None
 
-# vvv CHANGE 1: USE STRING TYPE HINTS TO AVOID CIRCULAR IMPORT vvv
 async def perform_automated_action(bot: 'AntiScamBot', alert_message: discord.Message, flagged_member_id: int, verdict_result: AnalysisResult, llm_config: dict):
     """
     Performs the automated action (ban or ignore) after the delay.
-    Includes safety checks and robust embed/view updating.
     """
-    # vvv CHANGE 2: USE A LOCAL IMPORT, WHICH IS SAFE AT RUNTIME vvv
-    # The local import for runtime logic is still necessary and correct.
-    from antiscam import ScreeningView
-
     guild = alert_message.guild
     try:
         await alert_message.channel.fetch_message(alert_message.id)
@@ -125,7 +110,7 @@ async def perform_automated_action(bot: 'AntiScamBot', alert_message: discord.Me
                 f"[Automated Action] Banned based on AI analysis. "
                 f"Reason: {verdict_result.reason} | AlertID:{alert_message.id}"
             )
-            delete_days = bot.config.get("delete_messages_on_ban_days_default", 1)
+            delete_days = get_delete_days_for_guild(bot, guild)
             await guild.ban(member, reason=reason, delete_message_seconds=delete_days * 86400)
             logger.info(f"AUTOMATED BAN of {member.name} in {guild.name}.")
             
@@ -160,7 +145,6 @@ async def perform_automated_action(bot: 'AntiScamBot', alert_message: discord.Me
         except Exception as e:
             logger.error(f"Failed to execute automated ignore for {member.name}: {e}")
 
-# vvv CHANGE 1 (AGAIN): USE STRING TYPE HINTS HERE TOO vvv
 async def delayed_action_wrapper(delay: int, bot: 'AntiScamBot', alert_message: discord.Message, flagged_member_id: int, verdict_result: AnalysisResult, llm_config: dict):
     """
     A wrapper coroutine that waits for a delay, then performs the automated action.
@@ -175,7 +159,7 @@ async def delayed_action_wrapper(delay: int, bot: 'AntiScamBot', alert_message: 
         if alert_message.id in bot.pending_ai_actions:
             del bot.pending_ai_actions[alert_message.id]
             
-async def start_llm_analysis_task(bot: 'AntiScamBot', alert_channel, embed, view, flagged_member, content_type, content, trigger):
+async def start_llm_analysis_task(bot: 'AntiScamBot', alert_channel: discord.TextChannel, embed: discord.Embed, view: discord.ui.View, flagged_member: discord.Member, content_type: str, content: str, trigger: str):
     """
     Orchestrates an AI-powered alert with a fallback to manual mode on API failure.
     """
@@ -191,23 +175,21 @@ async def start_llm_analysis_task(bot: 'AntiScamBot', alert_channel, embed, view
     verdict_text = f"{verdict_colors[verdict_result.verdict]} **{verdict_result.verdict.value}**\n*Reason: {verdict_result.reason}*"
     embed.add_field(name="🤖 AI Analysis", value=verdict_text, inline=False)
     
-    alert_message = await alert_channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions(users=[flagged_member]))
+    allowed_mentions = discord.AllowedMentions(users=[flagged_member])
+    alert_message = await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
 
     guild_id_str = str(alert_channel.guild.id)
     llm_defaults = bot.config.get("llm_settings", {}).get("defaults", {})
     llm_config = bot.config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
     
-    # --- THIS BLOCK IS NOW CORRECTED ---
     if llm_config.get("automation_mode") == "full" and verdict_result.verdict in [Verdict.MALICIOUS, Verdict.SAFE]:
         delay = llm_config.get("automation_delay_seconds", 180)
         logger.info(f"Scheduling automated action ({verdict_result.verdict.value}) for {flagged_member.name} in {delay} seconds.")
         
-        # Create a task for the *entire* delayed operation using the new wrapper.
         task = bot.loop.create_task(
             delayed_action_wrapper(
                 delay, bot, alert_message, flagged_member.id, verdict_result, llm_config
             )
         )
         
-        # Store this new, correct task so it can be cancelled by a button press.
         bot.pending_ai_actions[alert_message.id] = task
