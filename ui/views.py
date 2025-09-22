@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 
 from config import logger
 import data_manager
-from screening_handler import get_delete_days_for_guild
-from utils.federation_handler import propagate_ban
+from utils.federation_handler import process_federated_ban, process_federated_unban
 from utils.command_helpers import update_onboard_command_visibility
+from utils.helpers import get_delete_days_for_guild
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
@@ -241,6 +241,20 @@ class FederatedAlertView(discord.ui.View):
 
     @discord.ui.button(label="Unban Locally", style=discord.ButtonStyle.secondary, custom_id="fed_alert_unban")
     async def unban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.banned_user_id:
+            try:
+                embed_footer = interaction.message.embeds[0].footer.text
+                match = re.search(r'User ID: (\d+)', embed_footer)
+                if match:
+                    self.banned_user_id = int(match.group(1))
+                    logger.info(f"Recovered user ID {self.banned_user_id} from footer for persistent view.")
+                else:
+                    await interaction.response.send_message("❌ Could not find a valid user ID in the alert footer.", ephemeral=True)
+                    return
+            except (IndexError, AttributeError, TypeError):
+                await interaction.response.send_message("❌ Could not parse user ID from the alert footer.", ephemeral=True)
+                return
+            
         await interaction.response.defer()
         user_to_unban = discord.Object(id=self.banned_user_id)
         try:
@@ -255,6 +269,46 @@ class FederatedAlertView(discord.ui.View):
         except Exception as e:
             logger.error(f"Failed to reverse federated ban for {self.banned_user_id}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ Error unbanning: {e}", ephemeral=True)
+
+class FederatedUnbanAlertView(discord.ui.View):
+    def __init__(self, unbanned_user_id: Optional[int] = None):
+        super().__init__(timeout=None)
+        self.unbanned_user_id = unbanned_user_id
+
+    @discord.ui.button(label="Re-Ban Locally", style=discord.ButtonStyle.danger, custom_id="fed_alert_reban")
+    async def reban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        bot: 'AntiScamBot' = interaction.client
+
+        if not self.unbanned_user_id:
+            # Fallback to get ID from footer if needed
+            try:
+                embed_footer = interaction.message.embeds[0].footer.text
+                match = re.search(r'User ID: (\d+)', embed_footer)
+                if match:
+                    self.unbanned_user_id = int(match.group(1))
+                else:
+                    await interaction.followup.send("❌ Could not find user ID in the alert footer.", ephemeral=True)
+                    return
+            except (IndexError, AttributeError):
+                await interaction.followup.send("❌ Could not parse user ID from the alert.", ephemeral=True)
+                return
+
+        user_to_reban = discord.Object(id=self.unbanned_user_id)
+        try:
+            reason_text = "[Local Action] Federated unban reversed by local Moderator."
+            delete_days = get_delete_days_for_guild(bot, interaction.guild)
+            await interaction.guild.ban(user_to_reban, reason=reason_text, delete_message_seconds=delete_days * 86400)
+            
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.orange()
+            embed.description += f"\n\n**UPDATE:** User was re-banned in this server by {interaction.user.mention}."
+            button.disabled = True
+            await interaction.message.edit(embed=embed, view=self)
+            logger.info(f"Federated unban for {self.unbanned_user_id} was reversed in {interaction.guild.name} by {interaction.user.name}.")
+        except Exception as e:
+            logger.error(f"Failed to reverse federated unban for {self.unbanned_user_id}: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error re-banning: {e}", ephemeral=True)
 
 class ConfirmGlobalBanView(discord.ui.View):
     def __init__(self, bot: 'AntiScamBot', author: discord.User, user_to_ban: discord.User, reason: str):
@@ -291,21 +345,23 @@ class ConfirmGlobalBanView(discord.ui.View):
                     confirm_embed.set_author(name=f"{self.user_to_ban.name} (`{self.user_to_ban.id}`)", icon_url=self.user_to_ban.display_avatar.url)
                     confirm_embed.add_field(name="Reason", value=f"```{self.reason}```", inline=False)
                     await origin_mod_channel.send(embed=confirm_embed)
+            detailed_reason_field = {"name": "Ban Reason", "value": f"```{self.reason}```"}
 
-            await propagate_ban(
+            await process_federated_ban(
                 self.bot,
                 origin_guild=interaction.guild,
                 user_to_ban=self.user_to_ban,
                 moderator=interaction.user,
-                reason=self.reason
+                reason=self.reason,
+                detailed_reason_field=detailed_reason_field
             )
             
             await interaction.followup.send(f"✅ **Success!** The global ban for **{self.user_to_ban.name}** has been initiated and propagated.", ephemeral=True)
-            config.logger.info(f"Moderator {interaction.user.name} initiated a proactive global ban for {self.user_to_ban.name} from {interaction.guild.name}.")
+            logger.info(f"Moderator {interaction.user.name} initiated a proactive global ban for {self.user_to_ban.name} from {interaction.guild.name}.")
 
         except Exception as e:
             await interaction.followup.send(f"❌ **Error:** An unexpected error occurred during propagation. Please check the logs.", ephemeral=True)
-            config.logger.error(f"Error during proactive global ban propagation: {e}", exc_info=True)
+            logger.error(f"Error during proactive global ban propagation: {e}", exc_info=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -313,6 +369,46 @@ class ConfirmGlobalBanView(discord.ui.View):
             item.disabled = True
         await interaction.response.edit_message(content="Global ban cancelled.", embed=None, view=self)
 
+class ConfirmGlobalUnbanView(discord.ui.View):
+    def __init__(self, bot: 'AntiScamBot', author: discord.User, user_to_unban: discord.User, reason: str):
+        super().__init__(timeout=60.0)
+        self.bot = bot
+        self.author = author
+        self.user_to_unban = user_to_unban
+        self.reason = reason
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("You cannot interact with this confirmation.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm Global Unban", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="✅ **Confirmation received. Propagating global unban...**", embed=None, view=self)
+
+        try:
+            await process_federated_unban(
+                self.bot,
+                origin_guild=interaction.guild,
+                user_to_unban=self.user_to_unban,
+                moderator=interaction.user,
+                reason=self.reason
+            )
+            await interaction.followup.send(f"✅ **Success!** The global unban for **{self.user_to_unban.name}** has been initiated.", ephemeral=True)
+            logger.info(f"Moderator {interaction.user.name} initiated a global unban for {self.user_to_unban.name} from {interaction.guild.name}.")
+        except Exception as e:
+            await interaction.followup.send(f"❌ **Error:** An unexpected error occurred during propagation. Please check the logs.", ephemeral=True)
+            logger.error(f"Error during global unban propagation: {e}", exc_info=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Global unban cancelled.", embed=None, view=self)
+        
 class ConfirmScanView(discord.ui.View):
     def __init__(self, author: discord.User):
         super().__init__(timeout=60.0)
