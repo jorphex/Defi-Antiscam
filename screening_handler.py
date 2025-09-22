@@ -9,12 +9,13 @@ from datetime import datetime, timezone, timedelta
 from unidecode import unidecode
 from typing import TYPE_CHECKING
 
-from ui.views import ScreeningView
+from utils.helpers import get_timeout_minutes_for_guild, get_delete_days_for_guild
 import data_manager
 from config import logger, KEYWORDS_FILE
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
+    from ui.views import ScreeningView 
 
 
 # --- SCREENING ---
@@ -22,6 +23,7 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
     """
     Performs the complete screening process for a single member.
     """
+    from ui.views import ScreeningView
     config = bot.config
     federated_guild_ids = config.get("federated_guild_ids", [])
     found_bans = []
@@ -202,22 +204,6 @@ async def screen_bio(bot: 'AntiScamBot', member: discord.Member, keywords_data: 
     return {"flagged": False}
 
 # --- SCREENING HELPERS ---
-def get_timeout_minutes_for_guild(bot: 'AntiScamBot', guild: discord.Guild) -> int:
-    config = bot.config
-    per_guild_settings = config.get("timeout_duration_minutes_per_guild", {})
-    guild_id_str = str(guild.id)
-    if guild_id_str in per_guild_settings:
-        return per_guild_settings[guild_id_str]
-    return config.get("timeout_duration_minutes_default", 10)
-
-def get_delete_days_for_guild(bot: 'AntiScamBot', guild: discord.Guild) -> int:
-    config = bot.config
-    per_guild_settings = config.get("delete_messages_on_ban_days_per_guild", {})
-    guild_id_str = str(guild.id)
-    if guild_id_str in per_guild_settings:
-        return per_guild_settings[guild_id_str]
-    return config.get("delete_messages_on_ban_days_default", 1)
-
 def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list:
     if not text_to_check or not ruleset:
         return []
@@ -243,8 +229,8 @@ def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list:
         try:
             for txt in texts_to_scan_regex:
                 if re.search(pattern, txt, re.IGNORECASE):
-                    if "Matched Regex Pattern" not in triggered:
-                        triggered.append("Matched Regex Pattern")
+                    if "Matched Regex" not in triggered:
+                        triggered.append("Matched Regex")
                     break
         except re.error as e:
             logger.warning(f"Invalid regex pattern in {KEYWORDS_FILE}: '{pattern}' - {e}")
@@ -285,6 +271,7 @@ async def check_server_identity(bot: 'AntiScamBot', member: discord.Member) -> d
     return {"flagged": False}
 
 async def perform_automated_banned_elsewhere_ban(bot: 'AntiScamBot', alert_message: discord.Message, member: discord.Member, ban_reason_detail: str):
+    from ui.views import ScreeningView
     guild = alert_message.guild
     reason = f"[Automated Action] {ban_reason_detail} | AlertID:{alert_message.id}"
 
@@ -330,6 +317,7 @@ async def delayed_banned_elsewhere_wrapper(delay: int, bot: 'AntiScamBot', alert
             del bot.pending_ai_actions[alert_message.id]
 
 async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
+    from ui.views import ScreeningView
     config = bot.config
     guild = interaction.guild
     
