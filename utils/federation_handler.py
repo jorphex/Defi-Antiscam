@@ -1,22 +1,22 @@
-# /antiscam/utils/federation_handler.py
-
 import discord
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import data_manager
 from config import logger
-from screening_handler import get_delete_days_for_guild
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
     from ui.views import FederatedAlertView
+    from screening_handler import get_delete_days_for_guild
 
-async def process_federated_ban(bot: 'AntiScamBot', origin_guild: discord.Guild, user_to_ban: discord.User, moderator: discord.User, reason: str, detailed_reason_field: dict):
+async def process_federated_ban(bot: 'AntiScamBot', origin_guild: discord.Guild, user_to_ban: discord.User, moderator: discord.User, reason: str, detailed_reason_field: dict, is_proactive_command: bool = False):
     """
     The single source of truth for processing, counting, and propagating a federated ban.
     """
     from ui.views import FederatedAlertView
+    from screening_handler import get_delete_days_for_guild
+    
     stats = await data_manager.load_fed_stats()
     current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
 
@@ -44,11 +44,11 @@ async def process_federated_ban(bot: 'AntiScamBot', origin_guild: discord.Guild,
     global_stats["total_federated_actions_lifetime"] = global_stats.get("total_federated_actions_lifetime", 0) + 1
 
     # Send confirmation message to the ORIGIN server
-    if not moderator.bot:
+    if not is_proactive_command:
         origin_mod_channel_id = bot.config.get("federation_notice_channels", {}).get(str(origin_guild.id))
         if origin_mod_channel_id and (origin_mod_channel := bot.get_channel(origin_mod_channel_id)):
             embed_desc = (
-                f"Manual ban  for **{user_to_ban.name}** (`{user_to_ban.id}`) has been broadcast to all federated servers.\n\n"
+                f"The manual for **{user_to_ban.name}** (`{user_to_ban.id}`) has been broadcast to all federated servers.\n\n"
                 f"**Reason:**\n```{reason[:1000]}```"
             )
             origin_alert_embed = discord.Embed(
@@ -63,10 +63,7 @@ async def process_federated_ban(bot: 'AntiScamBot', origin_guild: discord.Guild,
                 logger.error(f"Failed to send manual ban confirmation to {origin_guild.name}: {e}")
 
     # Propagate the ban to other federated servers
-    for guild_id in bot.config.get("federated_guild_ids", []):
-        if guild_id == origin_guild.id:
-            continue
-        
+    for guild_id in bot.config.get("federated_guild_ids", []):       
         target_guild = bot.get_guild(guild_id)
         if not target_guild:
             continue
@@ -112,7 +109,7 @@ async def process_federated_ban(bot: 'AntiScamBot', origin_guild: discord.Guild,
     await data_manager.save_fed_stats(stats)
 
 
-async def process_federated_unban(bot: 'AntiScamBot', origin_guild: discord.Guild, user_to_unban: discord.User, moderator: discord.User, reason: str):
+async def process_federated_unban(bot: 'AntiScamBot', origin_guild: discord.Guild, user_to_unban: discord.User, moderator: discord.User, reason: str, is_proactive_command: bool = False):
     """
     The single source of truth for processing, counting, and propagating a federated unban.
     """
@@ -139,11 +136,26 @@ async def process_federated_unban(bot: 'AntiScamBot', origin_guild: discord.Guil
     global_stats = stats.setdefault("global", {})
     global_stats["total_federated_actions_lifetime"] = global_stats.get("total_federated_actions_lifetime", 0) + 1
 
+    if not is_proactive_command:
+        origin_mod_channel_id = bot.config.get("federation_notice_channels", {}).get(str(origin_guild.id))
+        if origin_mod_channel_id and (origin_mod_channel := bot.get_channel(origin_mod_channel_id)):
+            embed_desc = (
+                f"The manual unban by {moderator.mention} for **{user_to_unban.name}** (`{user_to_unban.id}`) has been broadcast to all federated servers.\n\n"
+                f"**Reason:**\n```{reason[:1000]}```"
+            )
+            origin_alert_embed = discord.Embed(
+                title="✅ Manual Unban Propagated",
+                description=embed_desc,
+                color=discord.Color.light_grey(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            try:
+                await origin_mod_channel.send(embed=origin_alert_embed)
+            except Exception as e:
+                logger.error(f"Failed to send manual unban confirmation to {origin_guild.name}: {e}")
+                
     # Propagate the unban
-    for guild_id in bot.config.get("federated_guild_ids", []):
-        if guild_id == origin_guild.id:
-            continue
-        
+    for guild_id in bot.config.get("federated_guild_ids", []):        
         target_guild = bot.get_guild(guild_id)
         if not target_guild:
             continue
