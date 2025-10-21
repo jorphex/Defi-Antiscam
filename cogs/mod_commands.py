@@ -1,5 +1,3 @@
-# /antiscam/cogs/mod_commands.py
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -9,13 +7,14 @@ from typing import TYPE_CHECKING
 
 import data_manager
 import screening_handler
-from ui.views import ConfirmScanView, RegexTestModal, OnboardView, ConfirmGlobalBanView, ConfirmGlobalUnbanView, LookupPaginatorView
+from ui.views import ConfirmScanView, RegexTestModal, OnboardView, ConfirmGlobalBanView, ConfirmGlobalUnbanView, LookupPaginatorView, TestCurrentRegexModal
 from utils.checks import has_mod_role, has_federated_mod_role, is_federated_moderator
 from utils.command_helpers import (
     format_keyword_list, add_keyword_to_list, add_regex_to_list,
     remove_keyword_from_list, remove_regex_from_list_by_id
 )
 from config import logger
+from screening_handler import test_text_against_regex
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
@@ -97,10 +96,10 @@ class ModCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         await add_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
 
-    @app_commands.command(name="test-regex", description="Tests a regex pattern against sample text using a pop-up form.")
+    @app_commands.command(name="test-new-regex", description="Tests a new regex pattern against sample text using a pop-up form.")
     @has_mod_role()
-    @discord.app_commands.describe(pattern="The regex pattern to test. Remember to escape special characters (e.g., '\\.').")
-    async def test_regex(self, interaction: discord.Interaction, pattern: str):
+    @app_commands.describe(pattern="The regex pattern to test. Remember to escape special characters (e.g., '\\.').")
+    async def test_new_regex(self, interaction: discord.Interaction, pattern: str):
         if not await has_federated_mod_role(interaction):
             return
 
@@ -111,6 +110,15 @@ class ModCommands(commands.Cog):
             return
 
         modal = RegexTestModal(pattern=pattern, compiled_regex=compiled_regex)
+        await interaction.response.send_modal(modal)
+
+    @app_commands.command(name="test-current-regex", description="Tests sample text against all current regex patterns using a pop-up box.")
+    @has_mod_role()
+    async def test_current_regex(self, interaction: discord.Interaction):
+        if not await has_federated_mod_role(interaction):
+            return
+        
+        modal = TestCurrentRegexModal()
         await interaction.response.send_modal(modal)
 
     @app_commands.command(name="add-regex", description="Adds a regex pattern to this server's local list. Try /test-regex first!")
@@ -157,7 +165,7 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     async def scanallmembers(self, interaction: discord.Interaction):
         if not await has_federated_mod_role(interaction): return
-        if interaction.guild.id in self.active_scans:
+        if interaction.guild.id in self.bot.active_scans:
             await interaction.response.send_message("❌ A scan is already in progress for this server.", ephemeral=True)
             return
         member_count = interaction.guild.member_count
@@ -167,16 +175,19 @@ class ModCommands(commands.Cog):
         if view.value is True:
             scan_task = self.bot.loop.create_task(screening_handler.run_full_scan(self.bot, interaction))
             self.bot.active_scans[interaction.guild.id] = scan_task
-        else:
-            await interaction.followup.send("Scan cancelled or timed out.", ephemeral=True)
+        elif view.value is None:
+            try:
+                await interaction.edit_original_response(content="Scan timed out.", view=None)
+            except discord.NotFound:
+                pass
 
     @app_commands.command(name="stopscan", description="Stops an ongoing member scan for this server.")
     @has_mod_role()
     async def stopscan(self, interaction: discord.Interaction):
         if not await has_federated_mod_role(interaction): return
         guild_id = interaction.guild.id
-        if guild_id in self.config.active_scans:
-            self.config.active_scans[guild_id].cancel()
+        if guild_id in self.bot.active_scans:
+            self.bot.active_scans[guild_id].cancel()
             logger.info(f"Moderator {interaction.user.name} stopped the scan for guild {guild_id}.")
             await interaction.response.send_message("✅ Scan cancellation requested.", ephemeral=True)
         else:
@@ -250,18 +261,56 @@ class ModCommands(commands.Cog):
             return
 
         welcome_embed = discord.Embed(
-            title="👋 Welcome!",
+            title="👋 Welcome to the Antiscam Federation",
             description=(
-                "This server is now part of my federated Defi Antiscam protection. "
-                "I screen new members, messages, and bios against a continuously growing shared list of threats.\n\n"
-                "Slash commands are available for whitelisted mod roles to manage filters, test regex patterns, look up users in the ban list, and more.  "
-                "Configuration options such as automation levels, whitelisted roles, timeout duration, log channels, and many more can be adjusted by contacting the bot maintainer using `/contact-maintainer`.\n\n"
-                "❗️ A certain level of trust is expected among federated servers, as many actions are shared.\n\n"
-                "**Next Step: Onboarding**\n"
-                "To protect this server immediately, I will now apply all historical bans from the master federated ban list. "
-                "This is a one-time action, which you can decline."
+                "The bot screens new members, messages, and bios against a shared threat database."
             ),
             color=discord.Color.blue()
+        )
+
+        welcome_embed.add_field(
+            name="🛠️ Moderator Commands Available to You",
+            value=(
+                "As a whitelisted moderator, you have access to several slash commands:\n"
+                "• Add and remove keywords to manage this server's custom keyword list.\n"
+                "• Add, remove, and test regex to manage and test regex filters.\n"
+                "• List keywords to see all active global and local keywords.\n"
+                "• Global ban and unban to manually ban or unban a known scammer across all federated servers.\n"
+                "• Lookup to search the federated ban list for a user ID or name.\n"
+                "• Scan all members to retroactively scan the server against the ban list.\n"
+                "• Stats to view this server's ban statistics."
+            ),
+            inline=False
+        )
+
+        welcome_embed.add_field(
+            name="⚙️ Server Configuration",
+            value=(
+                "You can request changes to this server's config by using the `/contact-maintainer` command:\n"
+                "• **Automation Level**: Full automation, suggest only, or off.\n"
+                "• **Alert & Notice Channels**: Specific channels for different types of notifications.\n"
+                "• **Timeout Duration**: How long flagged users are timed out for pending review.\n"
+                "• **Message Deletion Days**: How many days of a user's message history are purged on ban.\n"
+                "• **Whitelisted Roles**: Mod roles and other roles that should be exempt from all screening."
+            ),
+            inline=False
+        )
+    
+        welcome_embed.add_field(
+            name="❗️ A Note on Federation",
+            value=(
+                "A certain level of trust is expected among federated servers, as many actions are shared and propagated to all member servers."
+            ),
+            inline=False
+        )
+
+        welcome_embed.add_field(
+            name="🚀 Next Step: Onboarding Sync",
+            value=(
+                "I will apply all historical bans from the master federated list.\nThis is a **one-time action** that will ban known scammers.\n\n"
+                "Click **Begin Onboarding** to start the sync, or **Cancel** to abort (you can onboard later with `/onboard-server`)."
+            ),
+            inline=False
         )
         welcome_embed.add_field(
             name="Bans to Apply",
@@ -363,7 +412,7 @@ class ModCommands(commands.Cog):
         try:
             user_to_unban = await self.bot.fetch_user(target_user_id)
         except discord.NotFound:
-            # If user doesn't exist, we can still proceed with unban based on ID
+            # If user doesn't exist, proceed with unban based on ID
             user_to_unban = discord.Object(id=target_user_id)
             user_to_unban.name = fed_bans[user_id].get("username_at_ban", f"ID: {user_id}")
             user_to_unban.display_avatar = None # No avatar available
