@@ -1,15 +1,14 @@
-# /antiscam/ui/views.py
-
 import discord
 import re
 from typing import Optional, TYPE_CHECKING
 from datetime import datetime, timezone
-
+from unidecode import unidecode
 from config import logger
 import data_manager
 from utils.federation_handler import process_federated_ban, process_federated_unban
 from utils.command_helpers import update_onboard_command_visibility
 from utils.helpers import get_delete_days_for_guild
+from screening_handler import test_text_against_regex
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
@@ -29,7 +28,11 @@ class RegexTestModal(discord.ui.Modal, title="Regex Test"):
 
     async def on_submit(self, interaction: discord.Interaction):
         text_to_test = self.sample_text.value
-        match = self.compiled_regex.search(text_to_test)
+        
+        normalized_text_to_test = unidecode(text_to_test).lower()
+        
+        match = self.compiled_regex.search(normalized_text_to_test) # Test against the normalized version
+        
         if match:
             embed = discord.Embed(title="✅ Regex Test: Match Found", color=discord.Color.green())
             embed.add_field(name="Matched Text", value=f"`{match.group(0)}`", inline=False)
@@ -37,14 +40,75 @@ class RegexTestModal(discord.ui.Modal, title="Regex Test"):
             embed = discord.Embed(title="❌ Regex Test: No Match", color=discord.Color.orange())
         
         embed.add_field(name="Pattern", value=f"`{self.pattern}`", inline=False)
-        embed.add_field(name="Sample Text", value=f"```{text_to_test}```", inline=False)
+        # Show the original text so the user sees what they pasted
+        embed.add_field(name="Original Sample Text", value=f"```{text_to_test}```", inline=False)
+        # Also show the normalized version so they understand what the bot *actually* sees
+        if text_to_test != normalized_text_to_test:
+            embed.add_field(name="Normalized Text (What the bot tested)", value=f"```{normalized_text_to_test}```", inline=False)
+            
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         logger.error(f"Error in RegexTestModal: {error}", exc_info=True)
         await interaction.response.send_message("An unexpected error occurred. Please check the logs.", ephemeral=True)
 
+class TestCurrentRegexModal(discord.ui.Modal, title="Test Against Current Regex"):
+    def __init__(self):
+        super().__init__()
+
+    sample_text = discord.ui.TextInput(
+        label="Sample Text to Test",
+        style=discord.TextStyle.paragraph,
+        placeholder="Paste the raw, multi-line sample text here...",
+        required=True,
+        max_length=2000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         
+        text_to_test = self.sample_text.value
+        
+        normalized_text_to_test = unidecode(text_to_test).lower()
+
+        keywords_data = await data_manager.load_keywords()
+        guild_id_str = str(interaction.guild.id)
+
+        # Gather all applicable regex patterns (local and global)
+        local_patterns = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        global_patterns = keywords_data.get("global_keywords", {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        all_patterns = list(set(local_patterns + global_patterns))
+
+        if not all_patterns:
+            await interaction.followup.send("There are no regex patterns configured for this server or globally.", ephemeral=True)
+            return
+
+        matched_patterns = test_text_against_regex(normalized_text_to_test, all_patterns)
+
+        if matched_patterns:
+            embed = discord.Embed(title="✅ Regex Test: Match Found", color=discord.Color.green())
+            matched_list = "\n".join([f"- `{p}`" for p in matched_patterns])
+            embed.add_field(name="Matched Patterns", value=matched_list, inline=False)
+        else:
+            embed = discord.Embed(title="❌ Regex Test: No Match", color=discord.Color.orange())
+            embed.add_field(name="Result", value="The provided text did not match any of the current local or global regex patterns.", inline=False)
+
+        # Show the original text
+        embed.add_field(name="Original Sample Text", value=f"```{text_to_test}```", inline=False)
+        # Also show the normalized version for clarity
+        if text_to_test != normalized_text_to_test:
+            embed.add_field(name="Normalized Text (What the bot tested)", value=f"```{normalized_text_to_test}```", inline=False)
+            
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        logger.error(f"Error in TestCurrentRegexModal: {error}", exc_info=True)
+        # Check if response has been sent, as on_submit might have failed after deferring
+        if not interaction.response.is_done():
+            await interaction.response.send_message("An unexpected error occurred. Please check the logs.", ephemeral=True)
+        else:
+            await interaction.followup.send("An unexpected error occurred. Please check the logs.", ephemeral=True)
+
 # --- VIEWS ---
 class ScreeningView(discord.ui.View):
     def __init__(self, flagged_member_id: Optional[int] = None):
@@ -258,17 +322,34 @@ class FederatedAlertView(discord.ui.View):
         await interaction.response.defer()
         user_to_unban = discord.Object(id=self.banned_user_id)
         try:
+            await interaction.guild.fetch_ban(user_to_unban)
+        except discord.NotFound:
+            button.disabled = True
+            await interaction.followup.send("This user is not currently banned in this server.", ephemeral=True)
+            try:
+                embed = interaction.message.embeds[0]
+                if "UPDATE:" not in embed.description:
+                    embed.description += f"\n\n**UPDATE:** Action attempted by {interaction.user.mention}, but user was already unbanned."
+                await interaction.edit_original_response(embed=embed, view=self)
+            except Exception:
+                pass
+            return
+            
+        try:
             reason_text = "[Local Action] Federated ban reversed by local Moderator."
             await interaction.guild.unban(user_to_unban, reason=reason_text)
+            
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.green()
-            embed.description += f"\n\n**UPDATE:** User was unbanned from this server by a local contributor."
+            embed.description += f"\n\n**UPDATE:** User was unbanned from this server by {interaction.user.mention}."
             button.disabled = True
-            await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=self)
+            
+            await interaction.edit_original_response(embed=embed, view=self)
+            
             logger.info(f"Federated ban for {self.banned_user_id} was reversed in {interaction.guild.name} by {interaction.user.name}.")
         except Exception as e:
             logger.error(f"Failed to reverse federated ban for {self.banned_user_id}: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ Error unbanning: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ An unexpected error occurred while unbanning: {e}", ephemeral=True)
 
 class FederatedUnbanAlertView(discord.ui.View):
     def __init__(self, unbanned_user_id: Optional[int] = None):
@@ -353,7 +434,8 @@ class ConfirmGlobalBanView(discord.ui.View):
                 user_to_ban=self.user_to_ban,
                 moderator=interaction.user,
                 reason=self.reason,
-                detailed_reason_field=detailed_reason_field
+                detailed_reason_field=detailed_reason_field,
+                is_proactive_command=True
             )
             
             await interaction.followup.send(f"✅ **Success!** The global ban for **{self.user_to_ban.name}** has been initiated and propagated.", ephemeral=True)
@@ -390,12 +472,29 @@ class ConfirmGlobalUnbanView(discord.ui.View):
         await interaction.response.edit_message(content="✅ **Confirmation received. Propagating global unban...**", embed=None, view=self)
 
         try:
+            config = self.bot.config
+            origin_mod_channel_id = config.get("federation_notice_channels", {}).get(str(interaction.guild.id))
+            if origin_mod_channel_id and (origin_mod_channel := self.bot.get_channel(origin_mod_channel_id)):
+                confirm_embed = discord.Embed(
+                    title="✅ Proactive Global Unban Initiated",
+                    description=f"Unban was initiated from this server and has been broadcast to all federated servers.",
+                    color=discord.Color.green(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                if hasattr(self.user_to_unban, 'display_avatar') and self.user_to_unban.display_avatar:
+                    confirm_embed.set_author(name=f"{self.user_to_unban.name} (`{self.user_to_unban.id}`)", icon_url=self.user_to_unban.display_avatar.url)
+                else:
+                    confirm_embed.set_author(name=f"{self.user_to_unban.name} (`{self.user_to_unban.id}`)")
+                confirm_embed.add_field(name="Reason", value=f"```{self.reason}```", inline=False)
+                await origin_mod_channel.send(embed=confirm_embed)
+
             await process_federated_unban(
                 self.bot,
                 origin_guild=interaction.guild,
                 user_to_unban=self.user_to_unban,
                 moderator=interaction.user,
-                reason=self.reason
+                reason=self.reason,
+                is_proactive_command=True
             )
             await interaction.followup.send(f"✅ **Success!** The global unban for **{self.user_to_unban.name}** has been initiated.", ephemeral=True)
             logger.info(f"Moderator {interaction.user.name} initiated a global unban for {self.user_to_unban.name} from {interaction.guild.name}.")
@@ -585,3 +684,81 @@ class LookupPaginatorView(discord.ui.View):
             self.current_page += 1
             await interaction.response.edit_message(embed=self.create_embed(), view=self, allowed_mentions=self.allowed)
 
+class AnnouncementModal(discord.ui.Modal, title="New System Announcement"):
+    def __init__(self, bot: 'AntiScamBot'):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    announcement_text = discord.ui.TextInput(
+        label="Announcement Message",
+        style=discord.TextStyle.paragraph,
+        placeholder="Type your announcement here. This will be sent to all federated servers.",
+        required=True,
+        max_length=1500
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # 1. Prepare the embed that will be sent to everyone
+        announcement_embed = discord.Embed(
+            title="📢 System Announcement",
+            description=self.announcement_text.value,
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        announcement_embed.set_footer(text=f"A message from the {self.bot.user.name} maintainer.")
+
+        # 2. Iterate and send
+        success_guilds = []
+        failed_guilds = []
+        
+        federated_guild_ids = self.bot.config.get("federated_guild_ids", [])
+        for guild_id in federated_guild_ids:
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                failed_guilds.append(f"`{guild_id}` (Not Found)")
+                continue
+
+            # Get a unique set of channel IDs to avoid double-sending
+            channel_ids = set()
+            alert_channel_id = self.bot.config.get("action_alert_channels", {}).get(str(guild.id))
+            notice_channel_id = self.bot.config.get("federation_notice_channels", {}).get(str(guild.id))
+            if alert_channel_id: channel_ids.add(alert_channel_id)
+            if notice_channel_id: channel_ids.add(notice_channel_id)
+
+            if not channel_ids:
+                failed_guilds.append(f"{guild.name} (No channels configured)")
+                continue
+
+            sent_successfully = False
+            for channel_id in channel_ids:
+                channel = guild.get_channel(channel_id)
+                if not channel:
+                    logger.warning(f"Announcement: Could not find channel {channel_id} in {guild.name}.")
+                    continue
+                
+                try:
+                    await channel.send(embed=announcement_embed)
+                    sent_successfully = True
+                except discord.Forbidden:
+                    logger.error(f"Announcement: Missing permissions to send to #{channel.name} in {guild.name}.")
+                except Exception as e:
+                    logger.error(f"Announcement: Failed to send to #{channel.name} in {guild.name}: {e}")
+            
+            if sent_successfully:
+                success_guilds.append(guild.name)
+            else:
+                failed_guilds.append(f"{guild.name} (All sends failed)")
+
+        # 3. Send the final report back to the owner
+        report_embed = discord.Embed(
+            title="Announcement Broadcast Report",
+            color=discord.Color.green() if not failed_guilds else discord.Color.orange()
+        )
+        if success_guilds:
+            report_embed.add_field(name="✅ Successfully Sent To", value="\n".join(success_guilds), inline=False)
+        if failed_guilds:
+            report_embed.add_field(name="❌ Failed or Partially Failed For", value="\n".join(failed_guilds), inline=False)
+        
+        await interaction.followup.send(embed=report_embed, ephemeral=True)
