@@ -1,5 +1,3 @@
-# /antiscam/cogs/event_listeners.py
-
 import discord
 from discord.ext import commands
 import asyncio
@@ -59,14 +57,14 @@ class EventListeners(commands.Cog):
     
         await asyncio.sleep(2)
         try:
-            member = await member.guild.fetch_member(member.id)
+            full_member = await member.guild.fetch_member(member.id)
         except discord.NotFound:
             logger.warning(f"Member {member.name} left before they could be processed.")
             return
 
-        whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(member.guild.id), [])
-        if any(role.id in whitelisted_roles for role in member.roles):
-            logger.info(f"Member {member.name} has a whitelisted role. Skipping screen.")
+        whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(full_member.guild.id), [])
+        if any(role.id in whitelisted_roles for role in full_member.roles):
+            logger.info(f"Member {full_member.name} has a whitelisted role. Skipping screen.")
             return
 
         keywords_data = await data_manager.load_keywords()
@@ -74,51 +72,52 @@ class EventListeners(commands.Cog):
             logger.error("Could not load keywords for on_member_join screen. Aborting check.")
             return
 
-        result = await screening_handler.screen_member(self.bot, member, keywords_data)
+        result = await screening_handler.screen_member(self.bot, full_member, keywords_data)
 
         if result.get("flagged"):
-            logger.info(f"FLAGGED member on join: {member.name} in {member.guild.name}.")
-            mod_channel_id = config.get("action_alert_channels", {}).get(str(member.guild.id))
-            alert_channel = member.guild.get_channel(mod_channel_id) if mod_channel_id else None
+            logger.info(f"FLAGGED member on join: {full_member.name} in {full_member.guild.name}.")
+            mod_channel_id = config.get("action_alert_channels", {}).get(str(full_member.guild.id))
+            alert_channel = full_member.guild.get_channel(mod_channel_id) if mod_channel_id else None
         
             if alert_channel:
                 try:
-                    timeout_minutes = get_timeout_minutes_for_guild(self.bot, member.guild)
-                    await member.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason"))
+                    timeout_minutes = get_timeout_minutes_for_guild(self.bot, full_member.guild)
+                    await full_member.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason"))
                 
-                    view = ScreeningView(flagged_member_id=member.id)
+                    view = ScreeningView(flagged_member_id=full_member.id)
                     embed = result.get("embed")
-                    embed.set_footer(text=f"User ID: {member.id}")
+                    embed.set_footer(text=f"User ID: {full_member.id}")
 
-                    guild_id_str = str(member.guild.id)
+                    guild_id_str = str(full_member.guild.id)
                     llm_defaults = config.get("llm_settings", {}).get("defaults", {})
                     llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
 
                     if self.gemini_is_available and llm_config.get("automation_mode", "off") != "off":
-                        bio = getattr(await self.bot.fetch_user(member.id), 'bio', "")
+                        bio = getattr(await self.bot.fetch_user(full_member.id), 'bio', "")
                         self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
                             bot=self.bot,
                             alert_channel=alert_channel,
                             embed=embed,
                             view=view,
-                            flagged_member=member,
+                            flagged_member=full_member,
                             content_type="Bio/Username",
-                            content=f"Username: {member.name}\nNick: {member.nick}\nBio: {bio}",
+                            content=f"Username: {full_member.name}\nNick: {full_member.nick}\nBio: {bio}",
                             trigger=result.get("timeout_reason")
                         ))
                     else:
-                        allowed_mentions = discord.AllowedMentions(users=[member])
+                        allowed_mentions = discord.AllowedMentions(users=[full_member])
                         await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
 
                 except Exception as e:
-                    logger.error(f"Failed to take action on flagged member {member.name}: {e}", exc_info=True)
+                    logger.error(f"Failed to take action on flagged member {full_member.name}: {e}", exc_info=True)
         elif not result:
-            logger.info(f"Member {member.name} in {member.guild.name} flagged as 'Banned Elsewhere'. Automated action is pending.")
+            logger.info(f"Member {full_member.name} in {full_member.guild.name} flagged as 'Banned Elsewhere'. Automated action is pending.")
         else:
-            logger.info(f"Member {member.name} in {member.guild.name} passed all screenings.")
+            logger.info(f"Member {full_member.name} in {full_member.guild.name} passed all screenings.")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        # --- Initial Checks ---
         if message.author.bot or message.author == self.bot.user:
             return
         
@@ -133,53 +132,96 @@ class EventListeners(commands.Cog):
         whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(message.guild.id), [])
         if any(role.id in whitelisted_roles for role in message.author.roles): return
 
-        keywords_data = await data_manager.load_keywords()
-        if not keywords_data: return
+        # --- Logic Block ---
+        result = {}
 
-        result = await screening_handler.screen_message(message, keywords_data)
+        # 1. Image Wall Detection (High Priority Content Check)
+        cdn_regex_pattern = r"(?i)https?://(?:media|cdn)\.discordapp\.(?:net|com)/attachments/\d+/\d+/[^\\s]+"
+        cdn_links_found = re.findall(cdn_regex_pattern, message.content)
+        num_cdn_links = len(cdn_links_found)
 
-        if not result.get("flagged"):
-            author_id = message.author.id
-            current_time = datetime.now(timezone.utc)
-        
-            if author_id in self.bot.bio_check_cache:
-                last_checked = self.bot.bio_check_cache[author_id]
-                if (current_time - last_checked).total_seconds() < 300:
-                    return
-
-            bio_result = await screening_handler.screen_bio(self.bot, message.author, keywords_data)
-            self.bot.bio_check_cache[author_id] = current_time
-
-            if bio_result.get("flagged"):
-                embed = bio_result.get("embed")
-                embed.description = (
-                    f"**User:** {message.author.mention} (`{message.author.id}`)\n"
-                    f"This user sent a valid message in {message.channel.mention}, but their bio was flagged upon inspection."
+        if num_cdn_links >= 2:
+            # Check if the message is ONLY the links with minimal other text
+            remaining_text = message.content
+            for link in cdn_links_found:
+                remaining_text = remaining_text.replace(link, "")
+            
+            if len(remaining_text.strip()) < 15: # Low threshold for non-link text
+                timeout_reason = "Image-based scam detected (multiple CDN links)."
+                embed = discord.Embed(
+                    title="🖼️ Image-Based Scam Detected",
+                    description=f"**User:** {message.author.mention} (`{message.author.id}`)\n"
+                                f"Posted a wall of images, which is a common scam vector.",
+                    color=discord.Color.dark_orange(),
+                    timestamp=datetime.now(timezone.utc)
                 )
-                result = bio_result
+                embed.set_author(name=f"{message.author.name}", icon_url=message.author.display_avatar.url)
+                embed.add_field(name="📝 Message Content", value=f"```{message.content[:1000]}```", inline=False)
+                embed.add_field(name="🚩 Trigger", value="`Image Wall Detection`", inline=True)
+                embed.add_field(name="Status", value="Message deleted. User timed out. Awaiting review...", inline=True)
+                
+                result = {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
 
+        # 1. Flood Detection Check (High Priority)
+        elif screening_handler.check_for_flood(self.bot, message):
+            timeout_reason = "Flood detection triggered."
+            embed = discord.Embed(
+                title="🚨 Flood Detected",
+                description=f"**User:** {message.author.mention} (`{message.author.id}`)\n"
+                            f"Sent multiple messages across several channels in a short period.",
+                color=discord.Color.dark_red(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.set_author(name=f"{message.author.name}", icon_url=message.author.display_avatar.url)
+            embed.add_field(name="📝 Sample Message", value=f"```{message.content[:1000]}```", inline=False)
+            embed.add_field(name="🚩 Trigger", value="`Flood Detection`", inline=True)
+            embed.add_field(name="Status", value="Message deleted. User timed out. Awaiting review...", inline=True)
+            
+            result = {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
+
+        # 2. Content & Bio Screening (If no flood was detected)
+        elif not result.get("flagged"):
+            keywords_data = await data_manager.load_keywords()
+            if not keywords_data: return
+
+            content_result = await screening_handler.screen_message(message, keywords_data)
+            if content_result.get("flagged"):
+                result = content_result
+            else:
+                author_id = message.author.id
+                current_time = datetime.now(timezone.utc)
+                
+                if author_id not in self.bot.bio_check_cache or \
+                   (current_time - self.bot.bio_check_cache[author_id]).total_seconds() > 300:
+                    
+                    bio_result = await screening_handler.screen_bio(self.bot, message.author, keywords_data)
+                    self.bot.bio_check_cache[author_id] = current_time
+
+                    if bio_result.get("flagged"):
+                        embed = bio_result.get("embed")
+                        embed.description = (
+                            f"**User:** {message.author.mention} (`{message.author.id}`)\n"
+                            f"This user sent a valid message in {message.channel.mention}, but their bio was flagged upon inspection."
+                        )
+                        result = bio_result
+
+        # 3. Unified Action Block (Handles ANY flagged result)
         if result.get("flagged"):
             author = message.author
-            logger.info(f"FLAGGED event for {author.name} in #{message.channel.name} (Trigger: {'Bio' if 'Bio' in result['embed'].title else 'Message'}).")
+            trigger_type = result["embed"].title
+            logger.info(f"FLAGGED event for {author.name} in #{message.channel.name} (Trigger: {trigger_type}).")
         
-            if "Message" in result["embed"].title:
-                try: await message.delete()
-                except Exception as e: logger.error(f"Error deleting flagged message: {e}")
+            try: await message.delete()
+            except Exception as e: logger.error(f"Error deleting flagged message: {e}")
         
             try:
-                timeout_minutes = get_timeout_minutes_for_guild(self.bot, author.guild)
+                timeout_minutes = screening_handler.get_timeout_minutes_for_guild(self.bot, author.guild)
                 await author.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason", "Flagged content."))
-            except discord.HTTPException as e:
-                if e.code == 40007:
-                    logger.warning(f"Could not timeout {author.name} because they have already left the server.")
-                else:
-                    logger.error(f"Failed to timeout {author.name}: {e}")
             except Exception as e:
                  logger.error(f"An unexpected error occurred while trying to timeout {author.name}: {e}")
         
             mod_channel_id = config.get("action_alert_channels", {}).get(str(message.guild.id))
-            alert_channel = message.guild.get_channel(mod_channel_id) if mod_channel_id else None
-            if alert_channel:
+            if mod_channel_id and (alert_channel := self.bot.get_channel(mod_channel_id)):
                 try:
                     view = ScreeningView(flagged_member_id=author.id)
                     embed = result.get("embed")
@@ -196,15 +238,12 @@ class EventListeners(commands.Cog):
                             content_type = "Bio"
                             bio = getattr(await self.bot.fetch_user(author.id), 'bio', "")
                             content = bio
+                        elif "Flood" in embed.title:
+                            content_type = "Message (Flood)"
 
                         self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
-                            bot=self.bot,
-                            alert_channel=alert_channel,
-                            embed=embed,
-                            view=view,
-                            flagged_member=author,
-                            content_type=content_type,
-                            content=content,
+                            bot=self.bot, alert_channel=alert_channel, embed=embed, view=view,
+                            flagged_member=author, content_type=content_type, content=content,
                             trigger=result.get("timeout_reason")
                         ))
                     else:
