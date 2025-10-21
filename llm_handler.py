@@ -1,5 +1,3 @@
-# /antiscam/llm_handler.py
-
 import google.genai as genai
 from google.genai import types
 import os
@@ -11,11 +9,12 @@ import asyncio
 from typing import Optional, TYPE_CHECKING
 
 from config import logger
-from ui.views import ScreeningView
-from screening_handler import get_delete_days_for_guild
+from utils.helpers import get_delete_days_for_guild
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
+    from ui.views import ScreeningView
+    from utils.federation_handler import process_federated_ban
 
 # --- Pydantic Models for Structured Output ---
 class Verdict(str, enum.Enum):
@@ -82,6 +81,9 @@ async def perform_automated_action(bot: 'AntiScamBot', alert_message: discord.Me
     """
     Performs the automated action (ban or ignore) after the delay.
     """
+    from ui.views import ScreeningView
+    from utils.federation_handler import process_federated_ban
+    
     guild = alert_message.guild
     try:
         await alert_message.channel.fetch_message(alert_message.id)
@@ -106,19 +108,28 @@ async def perform_automated_action(bot: 'AntiScamBot', alert_message: discord.Me
 
     if verdict_result.verdict == Verdict.MALICIOUS:
         try:
-            reason = (
-                f"[Automated Action] Banned based on AI analysis. "
-                f"Reason: {verdict_result.reason} | AlertID:{alert_message.id}"
+            moderator = bot.user 
+            public_reason = f"Banned based on AI analysis. Reason: {verdict_result.reason}"
+            audit_log_reason = f"[Automated Action] {public_reason} | AlertID:{alert_message.id}"
+            detailed_reason_field = {"name": "AI Analysis Result", "value": f"```{public_reason}```"}
+            logger.info(f"AI verdict is MALICIOUS. Calling the global ban handler for {member.name}.")
+            
+            await process_federated_ban(
+                bot=bot,
+                origin_guild=guild,
+                user_to_ban=member,
+                moderator=moderator,
+                reason=audit_log_reason,
+                detailed_reason_field=detailed_reason_field
             )
-            delete_days = get_delete_days_for_guild(bot, guild)
-            await guild.ban(member, reason=reason, delete_message_seconds=delete_days * 86400)
-            logger.info(f"AUTOMATED BAN of {member.name} in {guild.name}.")
+            
+            logger.info(f"AUTOMATED GLOBAL BAN of {member.name} from {guild.name} has been processed.")
             
             embed = alert_message.embeds[0]
             embed.color = discord.Color.dark_red()
             for i, field in enumerate(embed.fields):
                 if field.name == "Status":
-                    embed.set_field_at(i, name="Status", value="🔴 Banned (Automated)", inline=True)
+                    embed.set_field_at(i, name="Status", value="🔴 Auto banned, malicious intent", inline=True)
                     break
             
             view = ScreeningView(flagged_member_id=flagged_member_id)
@@ -126,7 +137,7 @@ async def perform_automated_action(bot: 'AntiScamBot', alert_message: discord.Me
             await alert_message.edit(embed=embed, view=view)
 
         except Exception as e:
-            logger.error(f"Failed to execute automated ban for {member.name}: {e}")
+            logger.error(f"Failed to execute automated global ban for {member.name}: {e}", exc_info=True)
 
     elif verdict_result.verdict == Verdict.SAFE:
         try:
@@ -172,8 +183,9 @@ async def start_llm_analysis_task(bot: 'AntiScamBot', alert_channel: discord.Tex
         return
 
     verdict_colors = {Verdict.MALICIOUS: "🔴", Verdict.SUSPICIOUS: "🟡", Verdict.SAFE: "🟢"}
-    verdict_text = f"{verdict_colors[verdict_result.verdict]} **{verdict_result.verdict.value}**\n*Reason: {verdict_result.reason}*"
-    embed.add_field(name="🤖 AI Analysis", value=verdict_text, inline=False)
+    verdict_name = f"🤖 {verdict_colors[verdict_result.verdict]} **{verdict_result.verdict.value}**"    
+    verdict_text = f"*{verdict_result.reason}*"
+    embed.add_field(name=verdict_name, value=verdict_text, inline=False)
     
     allowed_mentions = discord.AllowedMentions(users=[flagged_member])
     alert_message = await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
