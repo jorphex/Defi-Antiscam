@@ -1,5 +1,3 @@
-# /antiscam/cogs/owner_commands.py
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -13,6 +11,11 @@ from utils.command_helpers import (
     add_regex_to_list, remove_regex_from_list_by_id
 )
 from config import logger
+from ui.views import AnnouncementModal
+
+
+import asyncio
+from screening_handler import get_delete_days_for_guild 
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
@@ -271,6 +274,116 @@ class OwnerCommands(commands.Cog):
         synced = await self.bot.tree.sync()
         await interaction.followup.send(f"✅ Synced {len(synced)} command(s) globally.")
         logger.info(f"Command tree synced by {interaction.user.name}. Synced {len(synced)} commands.")
+
+
+
+
+    @app_commands.command(name="zsync-origin-bans", description="[OWNER ONLY] Fixes bans missing from their origin server due to a past bug.")
+    @is_bot_owner()
+    async def zsync_origin_bans(self, interaction: discord.Interaction):
+        """
+        Scans the master ban list and applies any bans that are missing from their origin server.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        fed_bans = await data_manager.load_fed_bans()
+        if not fed_bans:
+            await interaction.followup.send("The federated ban list is empty. No action needed.", ephemeral=True)
+            return
+
+        # --- Simple Confirmation View ---
+        class ConfirmSyncView(discord.ui.View):
+            def __init__(self, author: discord.User):
+                super().__init__(timeout=60.0)
+                self.author = author
+                self.value = None
+            async def interaction_check(self, interaction: discord.Interaction) -> bool:
+                return interaction.user.id == self.author.id
+            @discord.ui.button(label="Confirm Sync", style=discord.ButtonStyle.danger)
+            async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+                self.value = True
+                self.stop()
+                for item in self.children: item.disabled = True
+                await interaction.response.edit_message(content="✅ **Confirmation received. Starting sync...**", view=self)
+            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+                self.value = False
+                self.stop()
+                for item in self.children: item.disabled = True
+                await interaction.response.edit_message(content="Sync cancelled.", view=self)
+
+        view = ConfirmSyncView(author=interaction.user)
+        await interaction.followup.send(
+            f"⚠️ **Are you sure?**\nThis will check all **{len(fed_bans)}** users in `bans.json`.\n"
+            "If a user is on the list but not banned in their origin server, this script will ban them there.",
+            view=view, ephemeral=True
+        )
+        await view.wait()
+
+        if view.value is not True:
+            return
+
+        progress_message = await interaction.channel.send("🔍 **Sync starting...** Checking ban list against origin servers.")
+        
+        checked_count = 0
+        missing_bans_applied = 0
+        errors = 0
+        update_interval = 25
+
+        for user_id_str, ban_data in fed_bans.items():
+            checked_count += 1
+            origin_guild_id = ban_data.get("origin_guild_id")
+            if not origin_guild_id:
+                continue
+
+            origin_guild = self.bot.get_guild(origin_guild_id)
+            if not origin_guild:
+                logger.warning(f"Sync: Could not find origin guild {origin_guild_id} for user {user_id_str}. Skipping.")
+                continue
+
+            user_obj = discord.Object(id=int(user_id_str))
+
+            try:
+                await origin_guild.fetch_ban(user_obj)
+                # User is correctly banned, do nothing.
+            except discord.NotFound:
+                # BAN IS MISSING! APPLY IT.
+                logger.warning(f"Sync: Found missing ban for user {user_id_str} in origin guild {origin_guild.name}. Applying now.")
+                try:
+                    reason = f"[SYNC ACTION] Applying missing ban from original command. Original reason: {ban_data.get('reason', 'N/A')}"
+                    delete_seconds = get_delete_days_for_guild(self.bot, origin_guild) * 86400
+                    await origin_guild.ban(user_obj, reason=reason[:512], delete_message_seconds=delete_seconds)
+                    missing_bans_applied += 1
+                except Exception as e:
+                    logger.error(f"Sync: FAILED to apply missing ban for {user_id_str} in {origin_guild.name}: {e}")
+                    errors += 1
+            except Exception as e:
+                logger.error(f"Sync: An unexpected error occurred checking ban for {user_id_str} in {origin_guild.name}: {e}")
+                errors += 1
+
+            if checked_count % update_interval == 0:
+                await progress_message.edit(content=f"🔍 Sync in progress... {checked_count}/{len(fed_bans)} checked. Applied {missing_bans_applied} missing bans.")
+            
+            await asyncio.sleep(0.01) # Be nice to the API
+
+        summary_embed = discord.Embed(
+            title="✅ Origin Ban Sync Complete",
+            color=discord.Color.green() if errors == 0 else discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        summary_embed.add_field(name="Total Records Checked", value=f"`{checked_count}`", inline=False)
+        summary_embed.add_field(name="Missing Bans Applied", value=f"`{missing_bans_applied}`", inline=True)
+        summary_embed.add_field(name="Errors Encountered", value=f"`{errors}`", inline=True)
+        summary_embed.set_footer(text="Check console logs for details on any errors.")
+
+        await progress_message.edit(content=None, embed=summary_embed)
+
+    @app_commands.command(name="zannounce", description="[OWNER ONLY] Sends an announcement to all federated servers.")
+    @is_bot_owner()
+    async def zannounce(self, interaction: discord.Interaction):
+        """Pops up a modal to send a system-wide announcement."""
+        modal = AnnouncementModal(self.bot)
+        await interaction.response.send_modal(modal)
 
 async def setup(bot: 'AntiScamBot'):
     await bot.add_cog(OwnerCommands(bot))
