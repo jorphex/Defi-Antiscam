@@ -1,5 +1,3 @@
-# /antiscam/screening_handler.py
-
 import os
 import re
 import aiohttp
@@ -12,6 +10,7 @@ from typing import TYPE_CHECKING
 from utils.helpers import get_timeout_minutes_for_guild, get_delete_days_for_guild
 import data_manager
 from config import logger, KEYWORDS_FILE
+import llm_handler
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
@@ -19,12 +18,71 @@ if TYPE_CHECKING:
 
 
 # --- SCREENING ---
+def check_for_flood(bot: 'AntiScamBot', message: discord.Message) -> bool:
+    """
+    Checks if a user's message constitutes a flood based on configured thresholds.
+    Returns True if a flood is detected, False otherwise.
+    """
+    flood_config = bot.config.get("flood_detection", {})
+    if not flood_config.get("enabled", False):
+        return False
+
+    now = datetime.now(timezone.utc)
+    user_id = message.author.id
+    guild_id = message.guild.id
+    
+    guild_history = bot.message_history.setdefault(guild_id, {})
+    user_history = guild_history.setdefault(user_id, [])
+
+    time_window = timedelta(seconds=flood_config.get("time_window_seconds", 5))
+    for timestamp, _ in user_history[:]:
+        if now - timestamp > time_window:
+            user_history.pop(0)
+        else:
+            break
+            
+    user_history.append((now, message.channel.id))
+
+    message_threshold = flood_config.get("message_threshold", 5)
+    channel_threshold = flood_config.get("channel_threshold", 2)
+
+    if len(user_history) >= message_threshold:
+        unique_channels = len(set(channel_id for _, channel_id in user_history))
+        if unique_channels >= channel_threshold:
+            logger.info(f"Flood detected for user {message.author.name} ({user_id}). "
+                        f"Messages: {len(user_history)}, Channels: {unique_channels}.")
+            user_history.clear()
+            return True
+
+    return False
+
 async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_data: dict) -> dict:
     """
     Performs the complete screening process for a single member.
     """
     from ui.views import ScreeningView
     config = bot.config
+
+    fed_bans = await data_manager.load_fed_bans()
+    if str(member.id) in fed_bans:
+        logger.info(f"SCREEN_MEMBER: Flagged {member.name} (Master List).")
+        
+        ban_data = fed_bans[str(member.id)]
+        original_reason = ban_data.get('reason', 'No reason recorded.')
+        timeout_reason = f"Flagged: User is on the master federated ban list."
+
+        embed = discord.Embed(
+            title="🚨 Flagged User (Master Ban List)",
+            description=f"**User:** {member.mention} (`{member.id}`)\nThis user is on the master federated ban list.",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
+        embed.add_field(name="Original Ban Reason", value=f"```{original_reason[:1000]}```", inline=False)
+        embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
+        
+        return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
+
     federated_guild_ids = config.get("federated_guild_ids", [])
     found_bans = []
     for other_guild_id in federated_guild_ids:
@@ -204,37 +262,53 @@ async def screen_bio(bot: 'AntiScamBot', member: discord.Member, keywords_data: 
     return {"flagged": False}
 
 # --- SCREENING HELPERS ---
-def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list:
+def test_text_against_regex(text_to_check: str, regex_patterns: list[str]) -> list[str]:
+    """
+    Tests a given string against a list of regex patterns.
+    Returns a list of the patterns that matched.
+    """
+    if not text_to_check or not regex_patterns:
+        return []
+
+    triggered_patterns = []
+
+    for pattern in regex_patterns:
+        try:
+            if re.search(pattern, text_to_check, re.IGNORECASE):
+                triggered_patterns.append(pattern)
+        except re.error as e:
+            logger.warning(f"Invalid regex pattern encountered during test: '{pattern}' - {e}")
+            continue
+            
+    return triggered_patterns
+
+def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list[str]:
+    """
+    Checks a given string against a specific ruleset (e.g., username rules or bio rules).
+    This version is hardened against common scammer evasion techniques.
+    """
     if not text_to_check or not ruleset:
         return []
 
     triggered = []
     normalized_text = unidecode(text_to_check).lower()
 
-    for keyword in ruleset.get("substring", []):
+    all_keywords = (
+        ruleset.get("username_keywords", {}).get("substring", []) +
+        ruleset.get("username_keywords", {}).get("smart", []) +
+        ruleset.get("bio_and_message_keywords", {}).get("simple_keywords", [])
+    )
+
+    for keyword in all_keywords:
         if keyword.lower() in normalized_text:
             triggered.append(keyword)
-    for keyword in ruleset.get("smart", []):
-        pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
-        if re.search(pattern, normalized_text):
-            triggered.append(keyword)
 
-    for keyword in ruleset.get("simple_keywords", []):
-        pattern = r'(?<![a-z])' + re.escape(keyword.lower()) + r'(?![a-z])'
-        if re.search(pattern, normalized_text):
-            triggered.append(keyword)
-    
-    texts_to_scan_regex = {text_to_check, normalized_text}
-    for pattern in ruleset.get("regex_patterns", []):
-        try:
-            for txt in texts_to_scan_regex:
-                if re.search(pattern, txt, re.IGNORECASE):
-                    if "Matched Regex" not in triggered:
-                        triggered.append("Matched Regex")
-                    break
-        except re.error as e:
-            logger.warning(f"Invalid regex pattern in {KEYWORDS_FILE}: '{pattern}' - {e}")
-            continue
+    matched_regex_patterns = test_text_against_regex(
+        normalized_text,
+        ruleset.get("bio_and_message_keywords", {}).get("regex_patterns", [])
+    )
+    if matched_regex_patterns:
+        triggered.append("Matched Regex Pattern")
             
     return list(set(triggered))
 
@@ -340,12 +414,15 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
     total_members = guild.member_count
     progress_message = None
     checked_count, flagged_count = 0, 0
-    update_interval = 100
+    update_interval = 50
     
+    event_listeners_cog = bot.get_cog("EventListeners")
+    gemini_is_available = event_listeners_cog.gemini_is_available if event_listeners_cog else False
+
     try:
         progress_message = await interaction.channel.send(f"🔍 Scan initiated. Preparing to scan {total_members} members in **{guild.name}**...")
         logger.info(f"Full member scan initiated by {interaction.user.name} for guild '{guild.name}'.")
-        for member in guild.members:
+        for i, member in enumerate(guild.members):
             if asyncio.current_task().cancelled():
                 raise asyncio.CancelledError
             checked_count += 1
@@ -364,8 +441,28 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
                     view = ScreeningView(flagged_member_id=member.id)
                     embed = result.get("embed")
                     embed.set_footer(text=f"User ID: {member.id}")
-                    allowed_mentions = discord.AllowedMentions(users=[member])
-                    await results_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
+
+                    guild_id_str = str(member.guild.id)
+                    llm_defaults = config.get("llm_settings", {}).get("defaults", {})
+                    llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
+
+                    if gemini_is_available and llm_config.get("automation_mode", "off") != "off":
+                        # AI-powered workflow for the scan
+                        bio = getattr(await bot.fetch_user(member.id), 'bio', "")
+                        bot.loop.create_task(llm_handler.start_llm_analysis_task(
+                            bot=bot,
+                            alert_channel=results_channel,
+                            embed=embed,
+                            view=view,
+                            flagged_member=member,
+                            content_type="Bio/Username (Scan)",
+                            content=f"Username: {member.name}\nNick: {member.nick}\nBio: {bio}",
+                            trigger=result.get("timeout_reason")
+                        ))
+                    else:
+                        # Manual-only workflow
+                        allowed_mentions = discord.AllowedMentions(users=[member])
+                        await results_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
 
                 except Exception as e:
                     logger.error(f"Failed to take action on scanned member {member.name}: {e}")
@@ -373,7 +470,8 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
                 progress_text = f"Scan in progress... {checked_count}/{total_members} members checked. **{flagged_count}** flagged so far."
                 await progress_message.edit(content=f"🔍 {progress_text}")
                 logger.info(f"Scan progress for {guild.name}: {progress_text}")
-            await asyncio.sleep(0.05)
+            if i % 50 == 0:
+                await asyncio.sleep(1)
         summary_text = f"Scan Complete for {guild.name}! Scanned {checked_count} members. Flagged {flagged_count} accounts."
         discord_summary = f"✅ **Scan Complete for {guild.name}!**\n- Scanned **{checked_count}** members.\n- Flagged a total of **{flagged_count}** suspicious accounts."
         if progress_message:
