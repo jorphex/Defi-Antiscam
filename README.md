@@ -33,3 +33,5 @@ Find me on the [Yearn Discord](https://discord.gg/yearn) or on [X](https://x.com
 - Yearn
 - BMX
 - Alchemix
+- Threshold Network
+- Icarus Finance
