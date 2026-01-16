@@ -35,3 +35,4 @@ Find me on the [Yearn Discord](https://discord.gg/yearn) or on [X](https://x.com
 - Alchemix
 - Threshold Network
 - Icarus Finance
+- Ethereal
