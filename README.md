@@ -9,12 +9,14 @@ A federated antiscam bot to proactively protect DeFi and crypto communities. Ins
 🤖 **Automatic Screening**:
 - **On Join**: Scans usernames, bios, and cross-references against the global federated ban list.
 - **On Message**: Scans message content for malicious links and keywords. Also performs periodic, cached checks of user bios to catch dormant threats.
+- **On Edit**: Scans message content after being edited, handling scammers who send harmless messages first then editing to show the scam payload.
 
 🔎 **Proactive & Reactive**:
 - **Real-time Actions**: Instantly deletes scam messages and times out offenders.
 - **Proactive Bans**: Moderators can issue a global ban by User ID *before* a known scammer joins any server.
 - **Retroactive Scanning**: A slash command to find threats already inside your server.
 - **Full Auto**: Reduce workload even more by opting in full auto mode in which the bot fully automates all actions.
+- **Mass Kick & Ban**: Handle raids and big groups of scammers and spammers
 
 ⚙️ **Advanced Toolkit**:
 - **Interactive Alerts**: Alerts with buttons (Ban, Kick, Unban, Ignore) for quick response.
