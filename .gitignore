@@ -47,6 +47,7 @@ Thumbs.db
 data/backup/
 data/
 legacy/
+README.dev.md
 
 # Project-specific notes/policies
 AGENTS.md

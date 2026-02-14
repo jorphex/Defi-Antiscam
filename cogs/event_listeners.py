@@ -303,7 +303,7 @@ class EventListeners(commands.Cog):
             return
         
         if ban_reason and ("Federated ban" in ban_reason or "Proactive ban" in ban_reason or "[Automated Action]" in ban_reason):
-            logger.info(f"Ignoring federated/automated ban echo for {user.name}.")
+            logger.debug(f"Ignoring federated/automated ban echo for {user.name}.")
             return
 
         if moderator.bot:
@@ -347,7 +347,7 @@ class EventListeners(commands.Cog):
             return
 
         if unban_reason and ("[Local Action]" in unban_reason or "Federated unban" in unban_reason):
-            logger.info(f"Ignoring local-only or federated unban echo for {user.name}.")
+            logger.debug(f"Ignoring local-only or federated unban echo for {user.name}.")
             return
 
         if moderator.bot and moderator.id != self.bot.user.id:

@@ -10,6 +10,7 @@ import os
 # This setup is perfect and should stay here.
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+logging.getLogger('google').setLevel(logging.WARNING)
 
 logging.getLogger('google.generativeai').setLevel(logging.WARNING)
 logging.getLogger('google.api_core').setLevel(logging.WARNING)
