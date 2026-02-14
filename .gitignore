@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+
+# Environments
+.env
+.env.*
+env/
+venv/
+.venv/
+ENV/
+VENV/
+pip-wheel-metadata/
+
+# Packaging / tooling
+*.egg-info/
+dist/
+build/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+.dockerignore
+
+# Logs / dumps
+*.log
+*.dump
+
+# Data / databases
+*.db
+*.sqlite
+*.sqlite3
+data/backup/
+data/
+legacy/
+
+# Project-specific notes/policies
+AGENTS.md
+MYNOTES.md
+antiscam.bak/

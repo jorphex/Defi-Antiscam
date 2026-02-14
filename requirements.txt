@@ -1,0 +1,7 @@
+discord.py
+google-genai
+pydantic
+python-dotenv
+unidecode
+aiosqlite
+ruamel.yaml
