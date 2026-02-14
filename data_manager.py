@@ -25,7 +25,7 @@ from config import (
 )
 
 logger = logging.getLogger()
-DB_FILE = "antiscam.db"
+DB_FILE = "data/antiscam.db"
 
 _yaml = YAML()
 _yaml.preserve_quotes = True
