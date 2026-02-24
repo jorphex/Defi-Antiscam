@@ -16,7 +16,6 @@ from utils.command_helpers import (
     remove_keyword_from_list, remove_regex_from_list_by_id
 )
 from config import logger
-from screening_handler import test_text_against_regex
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
@@ -29,7 +28,8 @@ class ModCommands(commands.Cog):
     @app_commands.command(name="stats", description="Displays local and federated ban statistics.")
     @has_mod_role()
     async def stats(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer()
         stats = await data_manager.load_fed_stats()
         guild_id_str = str(interaction.guild.id)
@@ -54,7 +54,8 @@ class ModCommands(commands.Cog):
     @app_commands.command(name="list-keywords", description="Lists all active screening keywords for this server.")
     @has_mod_role()
     async def list_keywords(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
 
         keywords_data = await data_manager.load_keywords()
@@ -78,7 +79,8 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="Example: 'admin' will match 'listadaoadmin' or 'admin123'.")
     async def add_username_keyword_substring(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         await add_keyword_to_list(interaction, keyword, "username_keywords", "substring")
 
@@ -86,7 +88,8 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="Example: 'mod' will match 'mod123' but IGNORE 'modern'.")
     async def add_username_keyword_smart(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         await add_keyword_to_list(interaction, keyword, "username_keywords", "smart")
 
@@ -94,7 +97,8 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="The keyword or phrase to add (e.g., 'dm me for help').")
     async def add_bio_keyword(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         await add_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
 
@@ -127,7 +131,8 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(pattern="The exact regex pattern. Use standard regex escaping (e.g., '\\.' for a dot, '\\s' for whitespace).")
     async def add_local_regex(self, interaction: discord.Interaction, pattern: str):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         await add_regex_to_list(interaction, pattern, is_global=False)
 
@@ -135,7 +140,8 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="The exact keyword to remove.")
     async def remove_username_keyword_substring(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         await remove_keyword_from_list(interaction, keyword, "username_keywords", "substring")
 
@@ -143,7 +149,8 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="The exact keyword to remove.")
     async def remove_username_keyword_smart(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         await remove_keyword_from_list(interaction, keyword, "username_keywords", "smart")
 
@@ -151,7 +158,8 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="The exact keyword or phrase to remove.")
     async def remove_bio_keyword(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         await remove_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
 
@@ -159,14 +167,16 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(index="The numerical ID of the regex pattern to remove.")
     async def remove_local_regex_by_id(self, interaction: discord.Interaction, index: int):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         await remove_regex_from_list_by_id(interaction, index, is_global=False)
 
     @app_commands.command(name="scanallmembers", description="Retroactively scans all server members against the screening list.")
     @has_mod_role()
     async def scanallmembers(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         if interaction.guild.id in self.bot.active_scans:
             await interaction.response.send_message("❌ A scan is already in progress for this server.", ephemeral=True)
             return
@@ -186,7 +196,8 @@ class ModCommands(commands.Cog):
     @app_commands.command(name="stopscan", description="Stops an ongoing member scan for this server.")
     @has_mod_role()
     async def stopscan(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction): return
+        if not await has_federated_mod_role(interaction):
+            return
         guild_id = interaction.guild.id
         if guild_id in self.bot.active_scans:
             self.bot.active_scans[guild_id].cancel()
@@ -224,7 +235,7 @@ class ModCommands(commands.Cog):
 
         embed = discord.Embed(
             title="📬 Contact Request",
-            description=f"A new message has been sent by a moderator.",
+            description="A new message has been sent by a moderator.",
             color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc)
         )
@@ -491,7 +502,7 @@ class ModCommands(commands.Cog):
     
         confirm_embed = discord.Embed(
             title="⚠️ Confirm Global Ban",
-            description=f"You are about to issue a federated ban for the following user. This action cannot be easily undone and will affect **all** federated servers.",
+            description="You are about to issue a federated ban for the following user. This action cannot be easily undone and will affect **all** federated servers.",
             color=discord.Color.orange()
         )
         confirm_embed.set_author(name=f"{user_to_ban.name} (`{user_to_ban.id}`)", icon_url=user_to_ban.display_avatar.url)
@@ -540,7 +551,7 @@ class ModCommands(commands.Cog):
 
         confirm_embed = discord.Embed(
             title="⚠️ Confirm Global Unban",
-            description=f"You are about to remove this user from the federated ban list. This will unban them from **all** federated servers.",
+            description="You are about to remove this user from the federated ban list. This will unban them from **all** federated servers.",
             color=discord.Color.orange()
         )
         if hasattr(user_to_unban, 'display_avatar') and user_to_unban.display_avatar:

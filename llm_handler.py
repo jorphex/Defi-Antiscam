@@ -3,7 +3,6 @@
 import google.genai as genai
 from google.genai import types
 import os
-import logging
 import enum
 from pydantic import BaseModel
 import discord
@@ -11,12 +10,9 @@ import asyncio
 from typing import Optional, TYPE_CHECKING
 
 from config import logger
-from utils.helpers import get_delete_days_for_guild
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
-    from ui.views import ScreeningView
-    from utils.federation_handler import process_federated_ban
 
 # --- Pydantic Models for Structured Output ---
 class Verdict(str, enum.Enum):
@@ -58,7 +54,7 @@ async def get_llm_verdict(bot: 'AntiScamBot', member: discord.Member, content_ty
         )
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash-lite",
+            model="gemini-2.5-flash-lite",
             contents=user_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=bot.system_prompt,

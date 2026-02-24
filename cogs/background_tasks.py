@@ -4,9 +4,7 @@ import discord
 from discord.ext import commands, tasks
 import os
 import aiohttp
-import base64
 import json
-import shutil
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -89,15 +87,17 @@ class BackgroundTasks(commands.Cog):
                     
                     for line in content_str.splitlines():
                         line = line.strip()
-                        if not line: continue
+                        if not line:
+                            continue
                         try:
                             profile = json.loads(line)
                             user_data = profile.get("user", {})
                             user_id_raw = user_data.get("id")
                             total_profiles_scanned += 1
-                            
-                            if not user_id_raw: continue
-                            
+
+                            if not user_id_raw:
+                                continue
+
                             user_id = str(user_id_raw)
                             
                             # Skip if we already processed this ID in this loop

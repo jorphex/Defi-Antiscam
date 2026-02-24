@@ -3,8 +3,6 @@
 import discord
 from discord.ext import commands
 import os
-import asyncio
-from collections import deque 
 import config
 import data_manager
 

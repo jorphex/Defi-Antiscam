@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 
 import data_manager
-from utils.checks import is_bot_owner, is_federated_moderator
+from utils.checks import is_bot_owner
 from utils.command_helpers import (
     add_global_keyword_to_list, remove_global_keyword_from_list,
     add_regex_to_list, remove_regex_from_list_by_id
@@ -328,13 +328,15 @@ class OwnerCommands(commands.Cog):
             async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
                 self.value = True
                 self.stop()
-                for item in self.children: item.disabled = True
+                for item in self.children:
+                    item.disabled = True
                 await interaction.response.edit_message(content="✅ **Confirmation received. Starting sync...**", view=self)
             @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
             async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
                 self.value = False
                 self.stop()
-                for item in self.children: item.disabled = True
+                for item in self.children:
+                    item.disabled = True
                 await interaction.response.edit_message(content="Sync cancelled.", view=self)
 
         view = ConfirmSyncView(author=interaction.user)

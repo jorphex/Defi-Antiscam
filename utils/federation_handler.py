@@ -9,8 +9,6 @@ from config import logger
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
-    from ui.views import FederatedAlertView
-    from utils.helpers import get_delete_days_for_guild
 
 # /antiscam/utils/federation_handler.py
 

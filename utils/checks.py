@@ -33,7 +33,8 @@ def has_mod_role():
         if interaction.user.id == app_info.owner.id:
             return True
 
-        if not interaction.guild: return False
+        if not interaction.guild:
+            return False
 
         if interaction.guild.id not in config.get("federated_guild_ids", []):
             await interaction.response.send_message("❌ This command can only be used in a federated server.", ephemeral=True)
@@ -90,7 +91,8 @@ async def is_federated_moderator(bot: 'AntiScamBot', user_id_to_check: int) -> b
         
         try:
             member = await guild.fetch_member(user_id_to_check)
-            if not member: return False
+            if not member:
+                return False
             return any(role.id in all_mod_roles for role in member.roles)
         except discord.NotFound:
             return False

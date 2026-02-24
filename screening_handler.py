@@ -17,7 +17,6 @@ import llm_handler
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
-    from ui.views import ScreeningView 
 
 
 # --- SCREENING ---
@@ -76,7 +75,7 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
         
         # In the DB, the column is 'reason', same as the JSON key
         original_reason = ban_data.get('reason', 'No reason recorded.')
-        timeout_reason = f"Flagged: User is on the master federated ban list."
+        timeout_reason = "Flagged: User is on the master federated ban list."
 
         # In the DB, the column is 'bio_at_import', same as the JSON key
         imported_bio = ban_data.get("bio_at_import")
@@ -100,9 +99,11 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
     federated_guild_ids = config.get("federated_guild_ids", [])
     found_bans = []
     for other_guild_id in federated_guild_ids:
-        if other_guild_id == member.guild.id: continue
+        if other_guild_id == member.guild.id:
+            continue
         other_guild = bot.get_guild(other_guild_id)
-        if not other_guild: continue
+        if not other_guild:
+            continue
         try:
             ban_entry = await other_guild.fetch_ban(member)
             if ban_entry:
@@ -202,7 +203,8 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
     return {"flagged": False}
 
 async def screen_message(message: discord.Message, keywords_data: dict) -> dict:
-    if not keywords_data: return {"flagged": False}
+    if not keywords_data:
+        return {"flagged": False}
 
     triggered_keywords = []
     local_rules = keywords_data.get("per_server_keywords", {}).get(str(message.guild.id), {})
@@ -232,7 +234,8 @@ async def screen_message(message: discord.Message, keywords_data: dict) -> dict:
     return {"flagged": False}
 
 async def screen_bio(bot: 'AntiScamBot', member: discord.Member, keywords_data: dict) -> dict:
-    if not keywords_data: return {"flagged": False}
+    if not keywords_data:
+        return {"flagged": False}
 
     bio = ""
     if hasattr(member, '_user') and hasattr(member._user, 'bio'):
@@ -501,7 +504,8 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
 
     if not results_channel:
         await interaction.followup.send(f"❌ **Scan Aborted:** Scan results channel not configured for {guild.name}.", ephemeral=True)
-        if guild.id in bot.active_scans: del bot.active_scans[guild.id]
+        if guild.id in bot.active_scans:
+            del bot.active_scans[guild.id]
         return
     if not guild.chunked:
         await guild.chunk()
@@ -509,7 +513,8 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
     keywords_data = await data_manager.load_keywords()
     if not keywords_data:
         await interaction.followup.send("❌ **Scan Aborted:** Could not load keywords file. Please check logs.", ephemeral=True)
-        if guild.id in bot.active_scans: del bot.active_scans[guild.id]
+        if guild.id in bot.active_scans:
+            del bot.active_scans[guild.id]
         return
     
     total_members = guild.member_count
@@ -527,7 +532,8 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
             if asyncio.current_task().cancelled():
                 raise asyncio.CancelledError
             checked_count += 1
-            if member.bot: continue
+            if member.bot:
+                continue
             whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(guild.id), [])
             if any(role.id in whitelisted_roles for role in member.roles):
                 continue
@@ -585,7 +591,7 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
     except Exception as e:
         logger.error(f"An unexpected error occurred during the full scan for {guild.name}: {e}", exc_info=True)
         if progress_message:
-            await progress_message.edit(content=f"❌ **Scan Failed!**\n- An unexpected error occurred. Please check the logs.")
+            await progress_message.edit(content="❌ **Scan Failed!**\n- An unexpected error occurred. Please check the logs.")
     finally:
         if guild.id in bot.active_scans:
             del bot.active_scans[guild.id]

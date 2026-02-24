@@ -429,7 +429,7 @@ class ConfirmGlobalBanView(discord.ui.View):
                 if origin_mod_channel:
                     confirm_embed = discord.Embed(
                         title="✅ Proactive Global Ban Initiated",
-                        description=f"Ban was initiated from this server and has been broadcast to all federated servers.",
+                        description="Ban was initiated from this server and has been broadcast to all federated servers.",
                         color=discord.Color.blue(),
                         timestamp=datetime.now(timezone.utc)
                     )
@@ -452,7 +452,7 @@ class ConfirmGlobalBanView(discord.ui.View):
             logger.info(f"Moderator {interaction.user.name} initiated a proactive global ban for {self.user_to_ban.name} from {interaction.guild.name}.")
 
         except Exception as e:
-            await interaction.followup.send(f"❌ **Error:** An unexpected error occurred during propagation. Please check the logs.", ephemeral=True)
+            await interaction.followup.send("❌ **Error:** An unexpected error occurred during propagation. Please check the logs.", ephemeral=True)
             logger.error(f"Error during proactive global ban propagation: {e}", exc_info=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -484,7 +484,7 @@ class AlreadyBannedView(discord.ui.View):
         try:
             # Check if the user is already banned in this specific server
             await interaction.guild.fetch_ban(self.user_to_ban)
-            await interaction.followup.send(f"ℹ️ **Action Not Needed:** This user is already banned in this server.", ephemeral=True)
+            await interaction.followup.send("ℹ️ **Action Not Needed:** This user is already banned in this server.", ephemeral=True)
         except discord.NotFound:
             # User is not banned locally, so proceed with the ban
             try:
@@ -494,10 +494,10 @@ class AlreadyBannedView(discord.ui.View):
                 await interaction.followup.send(f"✅ **Success!** {self.user_to_ban.name} has been banned from this server.", ephemeral=True)
                 logger.info(f"Moderator {interaction.user.name} applied a local-only ban to {self.user_to_ban.name} in {interaction.guild.name}.")
             except Exception as e:
-                await interaction.followup.send(f"❌ **Error:** An unexpected error occurred while applying the local ban. Please check the logs.", ephemeral=True)
+                await interaction.followup.send("❌ **Error:** An unexpected error occurred while applying the local ban. Please check the logs.", ephemeral=True)
                 logger.error(f"Error during local-only ban for already-federated user: {e}", exc_info=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ **Error:** An unexpected error occurred while checking the local ban status. Please check the logs.", ephemeral=True)
+            await interaction.followup.send("❌ **Error:** An unexpected error occurred while checking the local ban status. Please check the logs.", ephemeral=True)
             logger.error(f"Error checking local ban status for already-federated user: {e}", exc_info=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -532,7 +532,7 @@ class ConfirmGlobalUnbanView(discord.ui.View):
             if origin_mod_channel_id and (origin_mod_channel := self.bot.get_channel(origin_mod_channel_id)):
                 confirm_embed = discord.Embed(
                     title="✅ Proactive Global Unban Initiated",
-                    description=f"Unban was initiated from this server and has been broadcast to all federated servers.",
+                    description="Unban was initiated from this server and has been broadcast to all federated servers.",
                     color=discord.Color.green(),
                     timestamp=datetime.now(timezone.utc)
                 )
@@ -554,7 +554,7 @@ class ConfirmGlobalUnbanView(discord.ui.View):
             await interaction.followup.send(f"✅ **Success!** The global unban for **{self.user_to_unban.name}** has been initiated.", ephemeral=True)
             logger.info(f"Moderator {interaction.user.name} initiated a global unban for {self.user_to_unban.name} from {interaction.guild.name}.")
         except Exception as e:
-            await interaction.followup.send(f"❌ **Error:** An unexpected error occurred during propagation. Please check the logs.", ephemeral=True)
+            await interaction.followup.send("❌ **Error:** An unexpected error occurred during propagation. Please check the logs.", ephemeral=True)
             logger.error(f"Error during global unban propagation: {e}", exc_info=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -578,13 +578,15 @@ class ConfirmScanView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.value = True
         self.stop()
-        for item in self.children: item.disabled = True
+        for item in self.children:
+            item.disabled = True
         await interaction.response.edit_message(content="✅ **Confirmation received. Starting scan...** See below for progress updates.", view=self)
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.value = False
         self.stop()
-        for item in self.children: item.disabled = True
+        for item in self.children:
+            item.disabled = True
         await interaction.response.edit_message(content="Scan cancelled.", view=self)
 
 class OnboardView(discord.ui.View):
@@ -653,7 +655,7 @@ class OnboardView(discord.ui.View):
 
         completion_embed = discord.Embed(
             title="✅ Onboarding Complete",
-            description=f"The server is now up to date with the federated ban list.",
+            description="The server is now up to date with the federated ban list.",
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc)
         )
@@ -780,8 +782,10 @@ class AnnouncementModal(discord.ui.Modal, title="New System Announcement"):
             channel_ids = set()
             alert_channel_id = self.bot.config.get("action_alert_channels", {}).get(str(guild.id))
             notice_channel_id = self.bot.config.get("federation_notice_channels", {}).get(str(guild.id))
-            if alert_channel_id: channel_ids.add(alert_channel_id)
-            if notice_channel_id: channel_ids.add(notice_channel_id)
+            if alert_channel_id:
+                channel_ids.add(alert_channel_id)
+            if notice_channel_id:
+                channel_ids.add(notice_channel_id)
 
             if not channel_ids:
                 failed_guilds.append(f"{guild.name} (No channels configured)")
@@ -833,7 +837,7 @@ class ConfirmMassBanView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label=f"Confirm Mass Ban", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Confirm Mass Ban", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Local imports
         from utils.federation_handler import process_federated_ban

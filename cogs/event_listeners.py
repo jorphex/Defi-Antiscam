@@ -12,7 +12,7 @@ import llm_handler
 import screening_handler
 from config import logger
 from ui.views import ScreeningView, FederatedAlertView, FederatedUnbanAlertView
-from utils.helpers import get_delete_days_for_guild, get_timeout_minutes_for_guild
+from utils.helpers import get_timeout_minutes_for_guild
 from utils.federation_handler import process_federated_ban, process_federated_unban
 
 if TYPE_CHECKING:
@@ -55,7 +55,8 @@ class EventListeners(commands.Cog):
             logger.info(f"Bot owner ({member.name}) joined {member.guild.name}. Skipping screening.")
             return
 
-        if member.guild.id not in config.get("federated_guild_ids", []): return
+        if member.guild.id not in config.get("federated_guild_ids", []):
+            return
     
         await asyncio.sleep(2)
         try:
@@ -128,11 +129,14 @@ class EventListeners(commands.Cog):
         if bot_owner_id and message.author.id == bot_owner_id:
             return
     
-        if not message.guild or message.guild.id not in config.get("federated_guild_ids", []): return
-        if not isinstance(message.author, discord.Member): return
+        if not message.guild or message.guild.id not in config.get("federated_guild_ids", []):
+            return
+        if not isinstance(message.author, discord.Member):
+            return
     
         whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(message.guild.id), [])
-        if any(role.id in whitelisted_roles for role in message.author.roles): return
+        if any(role.id in whitelisted_roles for role in message.author.roles):
+            return
 
         # --- Logic Block ---
         result = {}
@@ -184,7 +188,8 @@ class EventListeners(commands.Cog):
         # 2. Content & Bio Screening (If no flood was detected)
         elif not result.get("flagged"):
             keywords_data = await data_manager.load_keywords()
-            if not keywords_data: return
+            if not keywords_data:
+                return
 
             content_result = await screening_handler.screen_message(message, keywords_data)
             if content_result.get("flagged"):
@@ -213,8 +218,10 @@ class EventListeners(commands.Cog):
             trigger_type = result["embed"].title
             logger.info(f"FLAGGED event for {author.name} in #{message.channel.name} (Trigger: {trigger_type}).")
         
-            try: await message.delete()
-            except Exception as e: logger.error(f"Error deleting flagged message: {e}")
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.error(f"Error deleting flagged message: {e}")
         
             try:
                 timeout_minutes = get_timeout_minutes_for_guild(self.bot, author.guild)
@@ -278,7 +285,8 @@ class EventListeners(commands.Cog):
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.User):
         config = self.bot.config
-        if guild.id not in config.get("federated_guild_ids", []): return
+        if guild.id not in config.get("federated_guild_ids", []):
+            return
     
         await asyncio.sleep(2) # Wait for audit log
         try:
@@ -331,7 +339,8 @@ class EventListeners(commands.Cog):
     @commands.Cog.listener()
     async def on_member_unban(self, guild: discord.Guild, user: discord.User):
         config = self.bot.config
-        if guild.id not in config.get("federated_guild_ids", []): return
+        if guild.id not in config.get("federated_guild_ids", []):
+            return
 
         await asyncio.sleep(2)
         try:
