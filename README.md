@@ -31,6 +31,20 @@ Protect your community by leveraging the collective experience of trusted DeFi p
 
 Find me on the [Yearn Discord](https://discord.gg/yearn) or on [X](https://x.com/JxyHelper) to get your server onboarded.
 
+## Required Bot Permissions
+
+The bot needs these permissions in any member server to function correctly:
+
+- `View Channels` (to read/send in configured channels)
+- `Send Messages`
+- `Embed Links` (for alerts and reports)
+- `Read Message History` (for context and moderation flows)
+- `Manage Messages` (to delete scam messages)
+- `Moderate Members` (to timeout flagged users)
+- `Ban Members` and `Unban Members`
+- `Kick Members` (used by moderator tools)
+- `View Audit Log` (to detect manual bans/unbans for federation)
+
 ### Current Federated Servers
 - Yearn
 - BMX
