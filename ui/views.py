@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from config import logger
 import data_manager
 from utils.federation_handler import process_federated_ban, process_federated_unban
-from utils.command_helpers import update_onboard_command_visibility
+from utils.command_helpers import update_onboard_command_visibility, edit_regex_by_id
 from utils.helpers import get_delete_days_for_guild
 from screening_handler import test_text_against_regex
 
@@ -588,6 +588,33 @@ class ConfirmScanView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(content="Scan cancelled.", view=self)
+
+class ConfirmRegexEditView(discord.ui.View):
+    def __init__(self, author: discord.User, index: int, new_pattern: str, is_global: bool):
+        super().__init__(timeout=60.0)
+        self.author = author
+        self.index = index
+        self.new_pattern = new_pattern
+        self.is_global = is_global
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("You cannot interact with this confirmation.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm Edit", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="✅ **Confirmation received. Updating regex...**", view=self)
+        await edit_regex_by_id(interaction, self.index, self.new_pattern, is_global=self.is_global)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Regex edit cancelled.", view=self)
 
 class OnboardView(discord.ui.View):
     def __init__(self, bot: 'AntiScamBot', author: discord.User, fed_bans: dict):

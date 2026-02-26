@@ -212,6 +212,57 @@ async def remove_regex_from_list_by_id(interaction: discord.Interaction, index: 
     else:
         await interaction.followup.send(f"❌ Invalid ID **`{index}`**. There is no regex pattern with that ID in the {list_name} list. Use `/list-keywords` to see available IDs.")
 
+async def edit_regex_by_id(interaction: discord.Interaction, index: int, new_pattern: str, is_global: bool):
+    if index <= 0:
+        await interaction.followup.send("❌ Index must be a positive number. Use `/list-keywords` to find the correct ID.")
+        return
+
+    try:
+        re.compile(new_pattern)
+    except re.error as e:
+        logger.warning(f"Moderator {interaction.user.name} tried to edit to an invalid regex: {new_pattern}. Error: {e}")
+        await interaction.followup.send(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`\nPlease test your pattern with `/test-regex` first.")
+        return
+
+    keywords_data = await data_manager.load_keywords()
+    target_list = None
+    list_name = ""
+
+    if is_global:
+        target_list = keywords_data.get("global_keywords", {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        list_name = "GLOBAL"
+    else:
+        guild_id_str = str(interaction.guild.id)
+        target_list = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        list_name = "local"
+
+    real_index = index - 1
+
+    if not target_list or not (0 <= real_index < len(target_list)):
+        await interaction.followup.send(f"❌ Invalid ID **`{index}`**. There is no regex pattern with that ID in the {list_name} list. Use `/list-keywords` to see available IDs.")
+        return
+
+    old_pattern = target_list[real_index]
+    if new_pattern == old_pattern:
+        await interaction.followup.send("ℹ️ The new regex is identical to the current entry. No changes were made.")
+        return
+
+    if new_pattern in target_list:
+        await interaction.followup.send(f"⚠️ That regex pattern already exists in the {list_name} list under a different ID. No changes were made.")
+        return
+
+    target_list[real_index] = new_pattern
+    await data_manager.save_keywords(keywords_data)
+    logger.info(
+        f"User {interaction.user.name} edited {list_name} regex by ID #{index}: "
+        f"'{old_pattern}' -> '{new_pattern}'"
+    )
+    await interaction.followup.send(
+        f"✅ Regex pattern **`{index}`** has been updated in the **{list_name}** list.\n"
+        f"> **Old:** `{old_pattern}`\n"
+        f"> **New:** `{new_pattern}`"
+    )
+
 async def update_onboard_command_visibility(bot: 'AntiScamBot', guild: discord.Guild):
     try:
         onboard_command = bot.tree.get_command("onboard-server")

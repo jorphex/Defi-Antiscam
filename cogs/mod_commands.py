@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import data_manager
 import screening_handler
-from ui.views import ConfirmScanView, RegexTestModal, OnboardView, ConfirmGlobalBanView, AlreadyBannedView, ConfirmGlobalUnbanView, LookupPaginatorView, TestCurrentRegexModal, ConfirmMassBanView, ConfirmMassKickView
+from ui.views import ConfirmScanView, RegexTestModal, OnboardView, ConfirmGlobalBanView, AlreadyBannedView, ConfirmGlobalUnbanView, LookupPaginatorView, TestCurrentRegexModal, ConfirmMassBanView, ConfirmMassKickView, ConfirmRegexEditView
 from utils.checks import has_mod_role, has_federated_mod_role, is_federated_moderator
 from utils.command_helpers import (
     format_keyword_list, add_keyword_to_list, add_regex_to_list,
@@ -172,6 +172,54 @@ class ModCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         await remove_regex_from_list_by_id(interaction, index, is_global=False)
 
+    @app_commands.command(name="edit-regex-by-id", description="Edits a regex in the local list by its ID from /list-keywords.")
+    @has_mod_role()
+    @discord.app_commands.describe(index="The numerical ID of the regex pattern to edit.", pattern="The new regex pattern.")
+    async def edit_local_regex_by_id(self, interaction: discord.Interaction, index: int, pattern: str):
+        if not await has_federated_mod_role(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        if index <= 0:
+            await interaction.followup.send("❌ Index must be a positive number. Use `/list-keywords` to find the correct ID.")
+            return
+
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            await interaction.followup.send(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`\nPlease test your pattern with `/test-regex` first.")
+            return
+
+        keywords_data = await data_manager.load_keywords()
+        guild_id_str = str(interaction.guild.id)
+        target_list = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        real_index = index - 1
+
+        if not target_list or not (0 <= real_index < len(target_list)):
+            await interaction.followup.send(f"❌ Invalid ID **`{index}`**. There is no regex pattern with that ID in the local list. Use `/list-keywords` to see available IDs.")
+            return
+
+        old_pattern = target_list[real_index]
+        if pattern == old_pattern:
+            await interaction.followup.send("ℹ️ The new regex is identical to the current entry. No changes were made.")
+            return
+
+        if pattern in target_list:
+            await interaction.followup.send("⚠️ That regex pattern already exists in the local list under a different ID. No changes were made.")
+            return
+
+        embed = discord.Embed(
+            title="Confirm Regex Edit",
+            description="Please confirm you want to replace this regex pattern.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="ID", value=f"`{index}`", inline=True)
+        embed.add_field(name="Old Pattern", value=f"`{old_pattern}`", inline=False)
+        embed.add_field(name="New Pattern", value=f"`{pattern}`", inline=False)
+
+        view = ConfirmRegexEditView(author=interaction.user, index=index, new_pattern=pattern, is_global=False)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
     @app_commands.command(name="scanallmembers", description="Retroactively scans all server members against the screening list.")
     @has_mod_role()
     async def scanallmembers(self, interaction: discord.Interaction):
@@ -288,7 +336,7 @@ class ModCommands(commands.Cog):
             value=(
                 "As a whitelisted moderator, you have access to several slash commands:\n"
                 "• Add and remove keywords to manage this server's custom keyword list.\n"
-                "• Add, remove, and test regex to manage and test regex filters.\n"
+                "• Add, remove, edit, and test regex to manage and test regex filters.\n"
                 "• List keywords to see all active global and local keywords.\n"
                 "• Global ban and unban to manually ban or unban a known scammer across all federated servers.\n"
                 "• Lookup to search the federated ban list for a user ID or name.\n"

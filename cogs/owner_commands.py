@@ -4,6 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
+import re
 from typing import TYPE_CHECKING
 
 import data_manager
@@ -13,7 +14,7 @@ from utils.command_helpers import (
     add_regex_to_list, remove_regex_from_list_by_id
 )
 from config import logger
-from ui.views import AnnouncementModal
+from ui.views import AnnouncementModal, ConfirmRegexEditView
 
 
 import asyncio
@@ -181,6 +182,51 @@ class OwnerCommands(commands.Cog):
     async def remove_global_regex_by_id(self, interaction: discord.Interaction, index: int):
         await interaction.response.defer(ephemeral=True)
         await remove_regex_from_list_by_id(interaction, index, is_global=True)
+
+    @app_commands.command(name="zedit-global-regex-by-id", description="[OWNER ONLY] Edits a regex in the GLOBAL list by its ID.")
+    @app_commands.describe(index="The numerical ID of the global regex pattern to edit.", pattern="The new regex pattern.")
+    @is_bot_owner()
+    async def edit_global_regex_by_id(self, interaction: discord.Interaction, index: int, pattern: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if index <= 0:
+            await interaction.followup.send("❌ Index must be a positive number. Use `/list-keywords` to find the correct ID.")
+            return
+
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            await interaction.followup.send(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`\nPlease test your pattern with `/test-regex` first.")
+            return
+
+        keywords_data = await data_manager.load_keywords()
+        target_list = keywords_data.get("global_keywords", {}).get("bio_and_message_keywords", {}).get("regex_patterns", [])
+        real_index = index - 1
+
+        if not target_list or not (0 <= real_index < len(target_list)):
+            await interaction.followup.send(f"❌ Invalid ID **`{index}`**. There is no regex pattern with that ID in the GLOBAL list. Use `/list-keywords` to see available IDs.")
+            return
+
+        old_pattern = target_list[real_index]
+        if pattern == old_pattern:
+            await interaction.followup.send("ℹ️ The new regex is identical to the current entry. No changes were made.")
+            return
+
+        if pattern in target_list:
+            await interaction.followup.send("⚠️ That regex pattern already exists in the GLOBAL list under a different ID. No changes were made.")
+            return
+
+        embed = discord.Embed(
+            title="Confirm Global Regex Edit",
+            description="Please confirm you want to replace this GLOBAL regex pattern.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="ID", value=f"`{index}`", inline=True)
+        embed.add_field(name="Old Pattern", value=f"`{old_pattern}`", inline=False)
+        embed.add_field(name="New Pattern", value=f"`{pattern}`", inline=False)
+
+        view = ConfirmRegexEditView(author=interaction.user, index=index, new_pattern=pattern, is_global=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="admin-backfill-banlist", description="[OWNER ONLY] Populates the master ban list from historical audit logs.")
     @is_bot_owner()
