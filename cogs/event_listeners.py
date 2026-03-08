@@ -79,42 +79,58 @@ class EventListeners(commands.Cog):
 
         if result.get("flagged"):
             logger.info(f"FLAGGED member on join: {full_member.name} in {full_member.guild.name}.")
+            try:
+                timeout_minutes = get_timeout_minutes_for_guild(self.bot, full_member.guild)
+                await full_member.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason"))
+            except Exception as e:
+                logger.error(f"Failed to timeout flagged member {full_member.name}: {e}", exc_info=True)
+
+            if result.get("automated_action_pending"):
+                logger.info(
+                    f"Member {full_member.name} in {full_member.guild.name} flagged as 'Banned Elsewhere'. "
+                    "Automated ban is pending after timeout."
+                )
+
+            if result.get("skip_alert_dispatch"):
+                return
+
             mod_channel_id = config.get("action_alert_channels", {}).get(str(full_member.guild.id))
             alert_channel = full_member.guild.get_channel(mod_channel_id) if mod_channel_id else None
-        
-            if alert_channel:
-                try:
-                    timeout_minutes = get_timeout_minutes_for_guild(self.bot, full_member.guild)
-                    await full_member.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason"))
-                
-                    view = ScreeningView(flagged_member_id=full_member.id)
-                    embed = result.get("embed")
-                    embed.set_footer(text=f"User ID: {full_member.id}")
+            if not alert_channel:
+                logger.warning(
+                    "Flagged member %s (%s) was timed out in %s, but no alert channel is configured or accessible.",
+                    full_member.name,
+                    full_member.id,
+                    full_member.guild.name,
+                )
+                return
 
-                    guild_id_str = str(full_member.guild.id)
-                    llm_defaults = config.get("llm_settings", {}).get("defaults", {})
-                    llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
+            try:
+                view = ScreeningView(flagged_member_id=full_member.id)
+                embed = result.get("embed")
+                embed.set_footer(text=f"User ID: {full_member.id}")
 
-                    if self.gemini_is_available and llm_config.get("automation_mode", "off") != "off":
-                        bio = getattr(await self.bot.fetch_user(full_member.id), 'bio', "")
-                        self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
-                            bot=self.bot,
-                            alert_channel=alert_channel,
-                            embed=embed,
-                            view=view,
-                            flagged_member=full_member,
-                            content_type="Bio/Username",
-                            content=f"Username: {full_member.name}\nNick: {full_member.nick}\nBio: {bio}",
-                            trigger=result.get("timeout_reason")
-                        ))
-                    else:
-                        allowed_mentions = discord.AllowedMentions(users=[full_member])
-                        await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
+                guild_id_str = str(full_member.guild.id)
+                llm_defaults = config.get("llm_settings", {}).get("defaults", {})
+                llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
 
-                except Exception as e:
-                    logger.error(f"Failed to take action on flagged member {full_member.name}: {e}", exc_info=True)
-        elif not result:
-            logger.info(f"Member {full_member.name} in {full_member.guild.name} flagged as 'Banned Elsewhere'. Automated action is pending.")
+                if self.gemini_is_available and llm_config.get("automation_mode", "off") != "off":
+                    bio = getattr(await self.bot.fetch_user(full_member.id), 'bio', "")
+                    self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
+                        bot=self.bot,
+                        alert_channel=alert_channel,
+                        embed=embed,
+                        view=view,
+                        flagged_member=full_member,
+                        content_type="Bio/Username",
+                        content=f"Username: {full_member.name}\nNick: {full_member.nick}\nBio: {bio}",
+                        trigger=result.get("timeout_reason")
+                    ))
+                else:
+                    allowed_mentions = discord.AllowedMentions(users=[full_member])
+                    await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
+            except Exception as e:
+                logger.error(f"Failed to take action on flagged member {full_member.name}: {e}", exc_info=True)
         else:
             logger.info(f"Member {full_member.name} in {full_member.guild.name} passed all screenings.")
 

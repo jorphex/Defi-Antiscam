@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from unidecode import unidecode
 from typing import TYPE_CHECKING
 
-from utils.helpers import get_timeout_minutes_for_guild, get_delete_days_for_guild
+from utils.helpers import get_timeout_minutes_for_guild, get_delete_days_for_guild, truncate_audit_reason
 import data_manager
 from config import logger
 import llm_handler
@@ -20,6 +20,27 @@ if TYPE_CHECKING:
 
 
 # --- SCREENING ---
+PROFILE_FETCH_TIMEOUT_SECONDS = 3
+MAX_TRIGGER_FIELD_LENGTH = 1000
+
+
+def _add_screening_latency(embed: discord.Embed, started_at: datetime) -> None:
+    elapsed_ms = max(int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000), 0)
+    embed.add_field(name="⏱️ Screening Latency", value=f"`{elapsed_ms} ms`", inline=True)
+
+
+def _format_trigger_value(triggered_keywords: list[str]) -> str:
+    unique_triggers = list(dict.fromkeys(triggered_keywords))
+    if not unique_triggers:
+        return "Unknown"
+
+    joined = ", ".join(unique_triggers)
+    if len(joined) <= MAX_TRIGGER_FIELD_LENGTH:
+        return joined
+
+    return joined[: MAX_TRIGGER_FIELD_LENGTH - 16] + "...(truncated)"
+
+
 def check_for_flood(bot: 'AntiScamBot', message: discord.Message) -> bool:
     """
     Checks if a user's message constitutes a flood based on configured thresholds.
@@ -67,6 +88,7 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
     """
     from ui.views import ScreeningView
     config = bot.config
+    screening_started_at = datetime.now(timezone.utc)
 
     ban_data = await data_manager.db_get_ban(member.id)
     
@@ -93,6 +115,7 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
             embed.add_field(name="📝 Bio at Time of Import", value=f"```{imported_bio[:1000]}```", inline=False)
 
         embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
+        _add_screening_latency(embed, screening_started_at)
         
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
 
@@ -115,13 +138,16 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
 
     if found_bans:
         banned_in_servers = ", ".join([ban['guild_name'] for ban in found_bans])
-        timeout_reason = f"Flagged on join: User is banned in partner server(s): {banned_in_servers}."
+        timeout_reason = truncate_audit_reason(
+            f"Flagged on join: User is banned in partner server(s): {banned_in_servers}."
+        )
         
         embed = discord.Embed(title="🚨 User Banned Elsewhere", description=f"**User:** {member.mention} (`{member.id}`)\nThis user is already banned in **{len(found_bans)}** other federated server(s).", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
         embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
         for ban in found_bans:
             embed.add_field(name=f"Banned In: {ban['guild_name']}", value=f"```{ban['reason'][:1000]}```", inline=False)
         embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
+        _add_screening_latency(embed, screening_started_at)
         embed.set_footer(text=f"User ID: {member.id}")
 
         guild_id_str = str(member.guild.id)
@@ -143,11 +169,22 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
                     delayed_banned_elsewhere_wrapper(delay, bot, alert_message, member, ban_reason_detail)
                 )
                 bot.pending_ai_actions[alert_message.id] = task
-            
-            return {}
+                return {
+                    "flagged": True,
+                    "embed": embed,
+                    "timeout_reason": timeout_reason,
+                    "skip_alert_dispatch": True,
+                    "automated_action_pending": True,
+                }
 
-        else:
-            return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
+            logger.warning(
+                "Full automation is enabled for %s (%s), but no valid alert channel is configured. "
+                "Falling back to manual enforcement.",
+                member.guild.name,
+                member.guild.id,
+            )
+
+        return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
 
     fetched_profile = None
     user_profile = member
@@ -174,6 +211,7 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
         embed.add_field(name="🚩 Trigger", value=f"`{timeout_reason}`", inline=False)
         embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
         embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+        _add_screening_latency(embed, screening_started_at)
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
     triggered_keywords = []
     name_text = f"{user_profile.name} {member.nick or ''}"
@@ -184,10 +222,20 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
     triggered_keywords.extend(check_text_for_keywords(name_text, local_rules.get("username_keywords", {})))
     triggered_keywords.extend(check_text_for_keywords(name_text, global_rules.get("username_keywords", {})))
     if bio:
-        triggered_keywords.extend(check_text_for_keywords(bio, local_rules.get("bio_and_message_keywords", {})))
-        triggered_keywords.extend(check_text_for_keywords(bio, global_rules.get("bio_and_message_keywords", {})))
-
-    triggered_keywords = list(set(triggered_keywords))
+        triggered_keywords.extend(
+            check_text_for_keywords(
+                bio,
+                local_rules.get("bio_and_message_keywords", {}),
+                regex_source_label="Local",
+            )
+        )
+        triggered_keywords.extend(
+            check_text_for_keywords(
+                bio,
+                global_rules.get("bio_and_message_keywords", {}),
+                regex_source_label="Global",
+            )
+        )
 
     if triggered_keywords:
         timeout_reason = "Flagged by keyword screening."
@@ -195,9 +243,10 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
         embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
         if bio:
             embed.add_field(name="📝 Bio", value=bio[:1024], inline=False)
-        embed.add_field(name="🚩 Trigger", value=f"`{', '.join(triggered_keywords)}`", inline=True)
+        embed.add_field(name="🚩 Trigger", value=f"`{_format_trigger_value(triggered_keywords)}`", inline=True)
         embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
         embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+        _add_screening_latency(embed, screening_started_at)
         return {"flagged": True, "embed": embed, "timeout_reason": "Flagged by keyword screening."}
 
     return {"flagged": False}
@@ -205,16 +254,29 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
 async def screen_message(message: discord.Message, keywords_data: dict) -> dict:
     if not keywords_data:
         return {"flagged": False}
+    screening_started_at = datetime.now(timezone.utc)
 
     triggered_keywords = []
     local_rules = keywords_data.get("per_server_keywords", {}).get(str(message.guild.id), {})
     global_rules = keywords_data.get("global_keywords", {})
 
-    triggered_keywords.extend(check_text_for_keywords(message.content, local_rules.get("bio_and_message_keywords", {})))
-    triggered_keywords.extend(check_text_for_keywords(message.content, global_rules.get("bio_and_message_keywords", {})))
-    triggered_keywords = list(set(triggered_keywords))
+    triggered_keywords.extend(
+        check_text_for_keywords(
+            message.content,
+            local_rules.get("bio_and_message_keywords", {}),
+            regex_source_label="Local",
+        )
+    )
+    triggered_keywords.extend(
+        check_text_for_keywords(
+            message.content,
+            global_rules.get("bio_and_message_keywords", {}),
+            regex_source_label="Global",
+        )
+    )
 
     if triggered_keywords:
+        trigger_value = _format_trigger_value(triggered_keywords)
         embed = discord.Embed(
             title="🚨 Flagged Message",
             description=f"**User:** {message.author.mention} (`{message.author.id}`)\n"
@@ -224,11 +286,12 @@ async def screen_message(message: discord.Message, keywords_data: dict) -> dict:
         )
         embed.set_author(name=f"{message.author.name}", icon_url=message.author.display_avatar.url)
         embed.add_field(name="📝 Flagged Message", value=f"```{message.content[:1000]}```", inline=False)
-        embed.add_field(name="🚩 Trigger", value=f"`{', '.join(triggered_keywords)}`", inline=True)
+        embed.add_field(name="🚩 Trigger", value=f"`{trigger_value}`", inline=True)
         embed.add_field(name="Status", value="Message deleted. User timed out. Awaiting review...", inline=True)
         embed.add_field(name="Account Age", value=f"<t:{int(message.author.created_at.timestamp())}:R>", inline=True)
+        _add_screening_latency(embed, screening_started_at)
         
-        timeout_reason = f"Flagged message. Triggered by: {', '.join(triggered_keywords)}"
+        timeout_reason = truncate_audit_reason(f"Flagged message. Triggered by: {trigger_value}")
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
         
     return {"flagged": False}
@@ -236,6 +299,7 @@ async def screen_message(message: discord.Message, keywords_data: dict) -> dict:
 async def screen_bio(bot: 'AntiScamBot', member: discord.Member, keywords_data: dict) -> dict:
     if not keywords_data:
         return {"flagged": False}
+    screening_started_at = datetime.now(timezone.utc)
 
     bio = ""
     if hasattr(member, '_user') and hasattr(member._user, 'bio'):
@@ -256,11 +320,23 @@ async def screen_bio(bot: 'AntiScamBot', member: discord.Member, keywords_data: 
     local_rules = keywords_data.get("per_server_keywords", {}).get(str(member.guild.id), {})
     global_rules = keywords_data.get("global_keywords", {})
 
-    triggered_keywords.extend(check_text_for_keywords(bio, local_rules.get("bio_and_message_keywords", {})))
-    triggered_keywords.extend(check_text_for_keywords(bio, global_rules.get("bio_and_message_keywords", {})))
-    triggered_keywords = list(set(triggered_keywords))
+    triggered_keywords.extend(
+        check_text_for_keywords(
+            bio,
+            local_rules.get("bio_and_message_keywords", {}),
+            regex_source_label="Local",
+        )
+    )
+    triggered_keywords.extend(
+        check_text_for_keywords(
+            bio,
+            global_rules.get("bio_and_message_keywords", {}),
+            regex_source_label="Global",
+        )
+    )
 
     if triggered_keywords:
+        trigger_value = _format_trigger_value(triggered_keywords)
         embed = discord.Embed(
             title="🚨 Flagged User Bio",
             description=f"**User:** {member.mention} (`{member.id}`)",
@@ -269,17 +345,18 @@ async def screen_bio(bot: 'AntiScamBot', member: discord.Member, keywords_data: 
         )
         embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
         embed.add_field(name="📝 Flagged Bio", value=f"```{bio[:1000]}```", inline=False)
-        embed.add_field(name="🚩 Trigger", value=f"`{', '.join(triggered_keywords)}`", inline=True)
+        embed.add_field(name="🚩 Trigger", value=f"`{trigger_value}`", inline=True)
         embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
         embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+        _add_screening_latency(embed, screening_started_at)
         
-        timeout_reason = f"Flagged user bio. Triggered by: {', '.join(triggered_keywords)}"
+        timeout_reason = truncate_audit_reason(f"Flagged user bio. Triggered by: {trigger_value}")
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
         
     return {"flagged": False}
 
 # --- SCREENING HELPERS ---
-def test_text_against_regex(text_to_check: str, regex_patterns: list[str]) -> list[str]:
+def test_text_against_regex(text_to_check: str, regex_patterns: list[str], regex_source_label: str | None = None) -> list[str]:
     """
     Tests a given string against a list of regex patterns.
     Returns a list of the patterns that matched.
@@ -289,17 +366,20 @@ def test_text_against_regex(text_to_check: str, regex_patterns: list[str]) -> li
 
     triggered_patterns = []
 
-    for pattern in regex_patterns:
+    for index, pattern in enumerate(regex_patterns, start=1):
         try:
             if re.search(pattern, text_to_check):
-                triggered_patterns.append(pattern)
+                if regex_source_label:
+                    triggered_patterns.append(f"{regex_source_label} regex #{index}: {pattern}")
+                else:
+                    triggered_patterns.append(f"Regex #{index}: {pattern}")
         except re.error as e:
             logger.warning(f"Invalid regex pattern encountered during test: '{pattern}' - {e}")
             continue
             
     return triggered_patterns
 
-def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list[str]:
+def check_text_for_keywords(text_to_check: str, ruleset: dict, regex_source_label: str | None = None) -> list[str]:
     """
     Checks a given string against a specific ruleset, correctly handling
     both "smart" (whole word) and "substring" (simple) keyword checks.
@@ -340,13 +420,14 @@ def check_text_for_keywords(text_to_check: str, ruleset: dict) -> list[str]:
     regex_patterns = ruleset.get("regex_patterns", [])
     if regex_patterns:
         matched_regex_patterns = test_text_against_regex(
-            text_to_check, 
-            regex_patterns
+            text_to_check,
+            regex_patterns,
+            regex_source_label=regex_source_label,
         )
         if matched_regex_patterns:
-            triggered.append("Matched Regex Pattern")
-            
-    return list(set(triggered))
+            triggered.extend(matched_regex_patterns)
+
+    return list(dict.fromkeys(triggered))
             
 async def check_server_identity(bot: 'AntiScamBot', member: discord.Member, profile: discord.abc.User | None = None) -> dict:
     def normalize_primary_guild(identity_source):
@@ -391,7 +472,8 @@ async def check_server_identity(bot: 'AntiScamBot', member: discord.Member, prof
         headers = {"Authorization": f"Bot {bot_token}"}
 
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=PROFILE_FETCH_TIMEOUT_SECONDS)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status == 200:
                         payload = await response.json()
@@ -402,6 +484,13 @@ async def check_server_identity(bot: 'AntiScamBot', member: discord.Member, prof
                             f"Server identity profile fetch failed for {member.name} ({member.id}) "
                             f"with status {response.status}."
                         )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Server identity profile fetch timed out for %s (%s) after %s seconds.",
+                member.name,
+                member.id,
+                PROFILE_FETCH_TIMEOUT_SECONDS,
+            )
         except aiohttp.ClientError as e:
             logger.error(f"HTTP error while fetching server identity for {member.name}: {e}")
         except Exception as e:
@@ -451,7 +540,7 @@ async def check_server_identity(bot: 'AntiScamBot', member: discord.Member, prof
 async def perform_automated_banned_elsewhere_ban(bot: 'AntiScamBot', alert_message: discord.Message, member: discord.Member, ban_reason_detail: str):
     from ui.views import ScreeningView
     guild = alert_message.guild
-    reason = f"[Automated Action] {ban_reason_detail} | AlertID:{alert_message.id}"
+    reason = truncate_audit_reason(f"[Automated Action] {ban_reason_detail} | AlertID:{alert_message.id}")
 
     try:
         delete_days = get_delete_days_for_guild(bot, guild)

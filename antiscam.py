@@ -31,7 +31,7 @@ class AntiScamBot(commands.Bot):
         config.logger.info("Database initialized successfully.")
         # <<< END OF FIX >>>
 
-        for filename in os.listdir('./cogs'):
+        for filename in os.listdir(config.COGS_DIR):
             if filename.endswith('.py'):
                 try:
                     # The [:-3] removes the '.py' from the file name

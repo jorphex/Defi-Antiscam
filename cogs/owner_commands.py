@@ -4,9 +4,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
+import os
 import re
 from typing import TYPE_CHECKING
 
+import config as app_config
 import data_manager
 from utils.checks import is_bot_owner
 from utils.command_helpers import (
@@ -27,6 +29,99 @@ if TYPE_CHECKING:
 class OwnerCommands(commands.Cog):
     def __init__(self, bot: 'AntiScamBot'):
         self.bot = bot
+
+    @staticmethod
+    def _truncate_field(value: str, limit: int = 1000) -> str:
+        if len(value) <= limit:
+            return value
+        return value[: limit - 16] + "\n...(truncated)"
+
+    def _collect_runtime_path_health(self) -> tuple[list[str], int]:
+        checks = [
+            ("Data Dir", app_config.DATA_DIR, True),
+            ("Server Config Dir", app_config.SERVERS_CONFIG_DIR, True),
+            ("Database", data_manager.DB_FILE, False),
+            ("Global Config", app_config.GLOBAL_CONFIG_FILE, False),
+            ("System Prompt", app_config.SYSTEM_PROMPT_FILE, False),
+        ]
+
+        issues = 0
+        lines = []
+        for label, path, expect_dir in checks:
+            exists = os.path.isdir(path) if expect_dir else os.path.exists(path)
+            writable_target = path if os.path.isdir(path) else os.path.dirname(path) or path
+            writable = os.access(writable_target, os.W_OK)
+            icon = "✅" if exists and writable else "⚠️"
+            if not exists or not writable:
+                issues += 1
+            lines.append(
+                f"{icon} {label}: exists={exists}, writable={writable}\n`{path}`"
+            )
+
+        return lines, issues
+
+    def _collect_background_task_health(self) -> tuple[list[str], int]:
+        bg_cog = self.bot.get_cog("BackgroundTasks")
+        if bg_cog is None:
+            return ["⚠️ BackgroundTasks cog is not loaded."], 1
+
+        issues = 0
+        lines = []
+        for label, loop in (
+            ("External Ban Sync", bg_cog.sync_external_bans),
+            ("Config Refresh", bg_cog.refresh_config_cache),
+        ):
+            running = loop.is_running()
+            next_iteration = getattr(loop, "next_iteration", None)
+            next_value = next_iteration.isoformat() if next_iteration else "n/a"
+            icon = "✅" if running else "⚠️"
+            if not running:
+                issues += 1
+            lines.append(f"{icon} {label}: running={running}, next={next_value}")
+
+        return lines, issues
+
+    def _collect_alert_channel_health(self) -> tuple[list[str], int, int]:
+        issues = []
+        healthy = 0
+
+        for guild_id in self.bot.config.get("federated_guild_ids", []):
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                issues.append(f"⚠️ Guild {guild_id}: bot is not currently in this guild.")
+                continue
+
+            channel_id = self.bot.config.get("action_alert_channels", {}).get(str(guild_id))
+            if channel_id is None:
+                issues.append(f"⚠️ {guild.name}: no action alert channel configured.")
+                continue
+
+            channel = guild.get_channel(channel_id)
+            if channel is None:
+                issues.append(f"⚠️ {guild.name}: configured alert channel {channel_id} was not found.")
+                continue
+
+            bot_member = guild.me or guild.get_member(self.bot.user.id)
+            if bot_member is None:
+                issues.append(f"⚠️ {guild.name}: could not resolve bot member for permission checks.")
+                continue
+
+            perms = channel.permissions_for(bot_member)
+            missing_perms = []
+            if not perms.view_channel:
+                missing_perms.append("view_channel")
+            if not perms.send_messages:
+                missing_perms.append("send_messages")
+
+            if missing_perms:
+                issues.append(
+                    f"⚠️ {guild.name}: missing {', '.join(missing_perms)} in #{channel.name}."
+                )
+                continue
+
+            healthy += 1
+
+        return issues, healthy, len(self.bot.config.get("federated_guild_ids", []))
 
     @app_commands.command(name="zreloadconfig", description="[Owner Only] Reloads configuration files from disk.")
     @is_bot_owner()
@@ -124,6 +219,49 @@ class OwnerCommands(commands.Cog):
                 f"Last reload: {fmt_dt(last_keywords)}"
             ),
             inline=False
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="zhealthcheck", description="[Owner Only] Checks runtime paths, alert channels, and background tasks.")
+    @is_bot_owner()
+    async def healthcheck(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        path_lines, path_issues = self._collect_runtime_path_health()
+        task_lines, task_issues = self._collect_background_task_health()
+        alert_issues, healthy_alerts, total_alerts = self._collect_alert_channel_health()
+
+        total_issues = path_issues + task_issues + len(alert_issues)
+        color = discord.Color.green() if total_issues == 0 else discord.Color.orange()
+        status = "Healthy" if total_issues == 0 else f"{total_issues} issue(s) detected"
+
+        embed = discord.Embed(
+            title="🩺 Runtime Health Check",
+            description=f"Status: **{status}**",
+            color=color,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="Paths",
+            value=self._truncate_field("\n".join(path_lines)),
+            inline=False,
+        )
+        embed.add_field(
+            name="Background Tasks",
+            value=self._truncate_field("\n".join(task_lines)),
+            inline=False,
+        )
+
+        alert_summary_lines = [f"Healthy alert channels: **{healthy_alerts}/{total_alerts}**"]
+        if alert_issues:
+            alert_summary_lines.extend(alert_issues)
+        else:
+            alert_summary_lines.append("✅ All configured alert channels are accessible.")
+
+        embed.add_field(
+            name="Alert Channels",
+            value=self._truncate_field("\n".join(alert_summary_lines)),
+            inline=False,
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 

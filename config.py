@@ -25,17 +25,22 @@ logging.getLogger('discord').setLevel(logging.INFO)
 
 
 # --- CONSTANTS & CONFIGURATION ---
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+SERVERS_CONFIG_DIR = os.path.join(DATA_DIR, "servers")
+LEGACY_DATA_DIR = os.path.join(BASE_DIR, "legacy", "data")
+COGS_DIR = os.path.join(BASE_DIR, "cogs")
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 BOT_TOKEN = os.getenv("ANTISCAM_BOT_TOKEN")
 
-GLOBAL_CONFIG_FILE = "data/global.yaml"
-SERVERS_CONFIG_DIR = "data/servers"
-LEGACY_CONFIG_FILE = "legacy/data/config.json"
-LEGACY_KEYWORDS_FILE = "legacy/data/keywords.json"
-FED_STATS_FILE = "data/stats.json"
-SYNC_STATUS_FILE = "data/sync_status.json"
-SCAM_SERVERS_FILE = "data/scam_servers.json"
-SYSTEM_PROMPT_FILE = "data/system_prompt.txt"
+GLOBAL_CONFIG_FILE = os.path.join(DATA_DIR, "global.yaml")
+LEGACY_CONFIG_FILE = os.path.join(LEGACY_DATA_DIR, "config.json")
+LEGACY_KEYWORDS_FILE = os.path.join(LEGACY_DATA_DIR, "keywords.json")
+FED_STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+SYNC_STATUS_FILE = os.path.join(DATA_DIR, "sync_status.json")
+SCAM_SERVERS_FILE = os.path.join(DATA_DIR, "scam_servers.json")
+SYSTEM_PROMPT_FILE = os.path.join(DATA_DIR, "system_prompt.txt")
 
 stats_lock = asyncio.Lock()
 keywords_lock = asyncio.Lock()

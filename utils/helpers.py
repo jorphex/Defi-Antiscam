@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
 
+
+AUDIT_REASON_LIMIT = 512
+
 def get_timeout_minutes_for_guild(bot: 'AntiScamBot', guild: discord.Guild) -> int:
     """Gets the configured timeout duration in minutes for a specific guild."""
     config = bot.config
@@ -25,3 +28,9 @@ def get_delete_days_for_guild(bot: 'AntiScamBot', guild: discord.Guild) -> int:
         return per_guild_settings[guild_id_str]
     
     return config.get("delete_messages_on_ban_days_default", 1)
+
+
+def truncate_audit_reason(reason_text: str, limit: int = AUDIT_REASON_LIMIT) -> str:
+    if len(reason_text) <= limit:
+        return reason_text
+    return reason_text[: limit - 16] + "...(truncated)"

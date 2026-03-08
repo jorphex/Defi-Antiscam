@@ -11,6 +11,7 @@ from ruamel.yaml.comments import CommentedMap
 from pydantic import BaseModel, ValidationError
 
 from config import (
+    DATA_DIR,
     GLOBAL_CONFIG_FILE,
     SERVERS_CONFIG_DIR,
     LEGACY_CONFIG_FILE,
@@ -25,7 +26,7 @@ from config import (
 )
 
 logger = logging.getLogger()
-DB_FILE = "data/antiscam.db"
+DB_FILE = os.path.join(DATA_DIR, "antiscam.db")
 
 _yaml = YAML()
 _yaml.preserve_quotes = True
@@ -124,6 +125,11 @@ def _write_yaml(path: str, data: CommentedMap) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         _yaml.dump(data, f)
+
+
+def ensure_runtime_dirs() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(SERVERS_CONFIG_DIR, exist_ok=True)
 
 
 def _compute_yaml_mtime() -> Optional[float]:
@@ -232,6 +238,7 @@ def _model_dump(model) -> dict:
 # --- DATABASE INITIALIZATION ---
 async def init_db():
     """Initializes the SQLite database and creates the table if missing."""
+    ensure_runtime_dirs()
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bans (
@@ -309,6 +316,7 @@ async def db_bulk_import_bans(ban_list: list[tuple]):
 # --- CONFIG & KEYWORDS ---
 
 def load_federation_config():
+    ensure_runtime_dirs()
     global _config_cache, _config_cache_mtime
     yaml_mtime = _compute_yaml_mtime()
     if _config_cache is not None and yaml_mtime is not None and _config_cache_mtime == yaml_mtime:
@@ -409,6 +417,7 @@ async def load_sync_status():
 
 async def save_sync_status(data: dict):
     async with sync_status_lock:
+        ensure_runtime_dirs()
         with open(SYNC_STATUS_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4)
 
@@ -424,11 +433,13 @@ async def load_fed_stats():
 
 async def save_fed_stats(data: dict):
     async with stats_lock:
+        ensure_runtime_dirs()
         with open(FED_STATS_FILE, 'w') as f:
             json.dump(data, f, indent=4)
 
 async def load_keywords():
     async with keywords_lock:
+        ensure_runtime_dirs()
         global _keywords_cache, _keywords_cache_mtime
         yaml_mtime = _compute_yaml_mtime()
         if _keywords_cache is not None and yaml_mtime is not None and _keywords_cache_mtime == yaml_mtime:
@@ -466,6 +477,7 @@ async def load_keywords():
 
 async def save_keywords(keywords_data: dict):
     async with keywords_lock:
+        ensure_runtime_dirs()
         global _keywords_cache, _keywords_cache_mtime
         # If YAML config doesn't exist yet, fall back to legacy JSON to avoid data loss.
         if not os.path.exists(GLOBAL_CONFIG_FILE) and os.path.exists(LEGACY_KEYWORDS_FILE):

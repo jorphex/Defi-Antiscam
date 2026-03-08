@@ -9,7 +9,7 @@ from config import logger
 import data_manager
 from utils.federation_handler import process_federated_ban, process_federated_unban
 from utils.command_helpers import update_onboard_command_visibility, edit_regex_by_id
-from utils.helpers import get_delete_days_for_guild
+from utils.helpers import get_delete_days_for_guild, truncate_audit_reason
 from screening_handler import test_text_against_regex
 
 if TYPE_CHECKING:
@@ -214,7 +214,9 @@ class ScreeningView(discord.ui.View):
                         descriptive_reason = f"Flagged for a message. Trigger: {field.value.strip('`')}."
                         break
             
-            reason_text = f"[Federated Action] {descriptive_reason} | AlertID:{interaction.message.id}"
+            reason_text = truncate_audit_reason(
+                f"[Federated Action] {descriptive_reason} | AlertID:{interaction.message.id}"
+            )
             
             delete_days = get_delete_days_for_guild(bot, interaction.guild)
             delete_seconds = delete_days * 86400

@@ -28,8 +28,10 @@ class BackgroundTasks(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         # This ensures the task runs once on startup, then begins its loop.
-        self.sync_external_bans.start()
-        self.refresh_config_cache.start()
+        if not self.sync_external_bans.is_running():
+            self.sync_external_bans.start()
+        if not self.refresh_config_cache.is_running():
+            self.refresh_config_cache.start()
 
     def cog_unload(self):
         self.sync_external_bans.cancel()
