@@ -54,7 +54,7 @@ async def get_llm_verdict(bot: 'AntiScamBot', member: discord.Member, content_ty
         )
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-3.1-flash-lite-preview",
             contents=user_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=bot.system_prompt,
