@@ -104,6 +104,12 @@ async def process_federated_ban(bot: 'AntiScamBot', origin_guild: discord.Guild,
     The single source of truth for processing, counting, and propagating a federated ban.
     OPTIMIZED: Uses asyncio.gather for concurrent execution.
     """
+    if data_manager.is_user_whitelisted(user_to_ban.id, bot.config):
+        logger.info(
+            f"Skipping federated ban for whitelisted user {user_to_ban.id} in {origin_guild.name}."
+        )
+        return
+
     stats = await data_manager.load_fed_stats()
     current_month_key = datetime.now(timezone.utc).strftime("%Y-%m")
 

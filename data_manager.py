@@ -22,6 +22,7 @@ from config import (
     SYSTEM_PROMPT_FILE,
     stats_lock,
     keywords_lock,
+    config_lock,
     sync_status_lock,
 )
 
@@ -84,6 +85,7 @@ class GlobalConfigModel(BaseModel):
     bot_owner_id: Optional[int] = None
     log_channel_id: Optional[int] = None
     manual_ban_default_reason: str = "Scam link"
+    whitelisted_user_ids: list[int] = []
     defaults: DefaultsModel = DefaultsModel()
     global_keywords: GlobalKeywordsModel = GlobalKeywordsModel()
 
@@ -313,6 +315,21 @@ async def db_bulk_import_bans(ban_list: list[tuple]):
         await db.commit()
         return cursor.rowcount
 
+
+def get_whitelisted_user_ids(config: Optional[dict] = None) -> set[int]:
+    if config is None:
+        config = load_federation_config()
+    raw_ids = config.get("whitelisted_user_ids", []) if config else []
+    return {int(user_id) for user_id in raw_ids}
+
+
+def is_user_whitelisted(user_id: int | str, config: Optional[dict] = None) -> bool:
+    try:
+        normalized_id = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    return normalized_id in get_whitelisted_user_ids(config)
+
 # --- CONFIG & KEYWORDS ---
 
 def load_federation_config():
@@ -350,6 +367,7 @@ def load_federation_config():
     config["bot_owner_id"] = global_model.bot_owner_id
     config["log_channel_id"] = global_model.log_channel_id
     config["manual_ban_default_reason"] = global_model.manual_ban_default_reason
+    config["whitelisted_user_ids"] = list(global_model.whitelisted_user_ids or [])
 
     config["timeout_duration_minutes_default"] = defaults.timeout_duration_minutes
     config["delete_messages_on_ban_days_default"] = defaults.delete_messages_on_ban_days
@@ -393,6 +411,47 @@ def load_federation_config():
     _config_cache_mtime = yaml_mtime
     _config_cache_source = "yaml"
     return config
+
+
+async def add_whitelisted_user_id(user_id: int | str) -> bool:
+    normalized_id = int(user_id)
+    async with config_lock:
+        ensure_runtime_dirs()
+        global _config_cache, _config_cache_mtime, _config_cache_source
+        global_yaml = _read_yaml(GLOBAL_CONFIG_FILE) or CommentedMap()
+        whitelist = list(global_yaml.get("whitelisted_user_ids", []))
+        if normalized_id in whitelist:
+            return False
+        whitelist.append(normalized_id)
+        whitelist.sort()
+        global_yaml["whitelisted_user_ids"] = whitelist
+        _write_yaml(GLOBAL_CONFIG_FILE, global_yaml)
+        _config_cache = None
+        _config_cache_mtime = None
+        _config_cache_source = None
+
+    load_federation_config()
+    return True
+
+
+async def remove_whitelisted_user_id(user_id: int | str) -> bool:
+    normalized_id = int(user_id)
+    async with config_lock:
+        ensure_runtime_dirs()
+        global _config_cache, _config_cache_mtime, _config_cache_source
+        global_yaml = _read_yaml(GLOBAL_CONFIG_FILE) or CommentedMap()
+        whitelist = list(global_yaml.get("whitelisted_user_ids", []))
+        if normalized_id not in whitelist:
+            return False
+        whitelist.remove(normalized_id)
+        global_yaml["whitelisted_user_ids"] = whitelist
+        _write_yaml(GLOBAL_CONFIG_FILE, global_yaml)
+        _config_cache = None
+        _config_cache_mtime = None
+        _config_cache_source = None
+
+    load_federation_config()
+    return True
 
 
 def load_scam_servers() -> list[int]:

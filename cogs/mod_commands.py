@@ -25,6 +25,57 @@ class ModCommands(commands.Cog):
     def __init__(self, bot: 'AntiScamBot'):
         self.bot = bot
 
+    async def _resolve_user_for_action(self, user_id: int, fallback_name: str | None = None):
+        try:
+            return await self.bot.fetch_user(user_id)
+        except discord.NotFound:
+            user = discord.Object(id=user_id)
+            user.name = fallback_name or f"ID: {user_id}"
+            user.display_avatar = None
+            return user
+        except Exception as e:
+            logger.warning(f"Falling back to bare user object for {user_id}: {e}")
+            user = discord.Object(id=user_id)
+            user.name = fallback_name or f"ID: {user_id}"
+            user.display_avatar = None
+            return user
+
+    async def _unban_whitelisted_user_everywhere(
+        self,
+        user_to_unban: discord.abc.Snowflake,
+        moderator: discord.abc.User,
+    ) -> tuple[int, list[str]]:
+        success_count = 0
+        unbanned_guilds: list[str] = []
+        audit_reason = f"[Whitelist] Unbanned by {moderator.name} after whitelist add."
+
+        for guild_id in self.bot.config.get("federated_guild_ids", []):
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                continue
+
+            try:
+                await guild.fetch_ban(user_to_unban)
+            except discord.NotFound:
+                continue
+            except discord.Forbidden:
+                logger.warning(f"Missing permissions to check ban for {user_to_unban.id} in {guild.name}.")
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error checking ban for {user_to_unban.id} in {guild.name}: {e}", exc_info=True)
+                continue
+
+            try:
+                await guild.unban(user_to_unban, reason=audit_reason[:512])
+                success_count += 1
+                unbanned_guilds.append(guild.name)
+            except discord.Forbidden:
+                logger.warning(f"Missing permissions to unban whitelisted user {user_to_unban.id} in {guild.name}.")
+            except Exception as e:
+                logger.error(f"Unexpected error unbanning whitelisted user {user_to_unban.id} in {guild.name}: {e}", exc_info=True)
+
+        return success_count, unbanned_guilds
+
     @app_commands.command(name="stats", description="Displays local and federated ban statistics.")
     @has_mod_role()
     async def stats(self, interaction: discord.Interaction):
@@ -532,6 +583,13 @@ class ModCommands(commands.Cog):
         if await is_federated_moderator(self.bot, user_to_ban.id):
             await interaction.response.send_message("❌ **Action Prohibited:** You cannot target another federated moderator. This action must be performed manually by the bot owner if necessary.", ephemeral=True)
             return
+
+        if data_manager.is_user_whitelisted(user_to_ban.id, config):
+            await interaction.response.send_message(
+                "❌ **Action Prohibited:** This user is on the global whitelist and cannot be added to the federated ban list.",
+                ephemeral=True,
+            )
+            return
     
         existing_ban = await data_manager.db_get_ban(user_id)
         if existing_ban:
@@ -610,7 +668,85 @@ class ModCommands(commands.Cog):
 
         view = ConfirmGlobalUnbanView(self.bot, interaction.user, user_to_unban, reason)
         await interaction.response.send_message(embed=confirm_embed, view=view, ephemeral=True)
-        
+
+    @app_commands.command(name="whitelist-add", description="Adds a user ID to the global whitelist and removes existing federated bans.")
+    @app_commands.describe(user_id="The Discord User ID to whitelist.")
+    @has_mod_role()
+    async def whitelist_add(self, interaction: discord.Interaction, user_id: str):
+        if not await has_federated_mod_role(interaction):
+            return
+
+        if not user_id.isdigit():
+            await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID.", ephemeral=True)
+            return
+
+        target_user_id = int(user_id)
+        if target_user_id == self.bot.user.id:
+            await interaction.response.send_message("❌ **Action Prohibited:** I cannot whitelist myself.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        existing_ban = await data_manager.db_get_ban(target_user_id)
+        fallback_name = existing_ban.get("username") if existing_ban else None
+        user_to_whitelist = await self._resolve_user_for_action(target_user_id, fallback_name=fallback_name)
+
+        added = await data_manager.add_whitelisted_user_id(target_user_id)
+        self.bot.config = data_manager.load_federation_config()
+
+        removed_from_master_list = False
+        if existing_ban:
+            await data_manager.db_remove_ban(target_user_id)
+            removed_from_master_list = True
+
+        unban_count, unbanned_guilds = await self._unban_whitelisted_user_everywhere(user_to_whitelist, interaction.user)
+
+        logger.info(
+            f"Moderator {interaction.user.name} added {target_user_id} to the global whitelist. "
+            f"Removed from master list={removed_from_master_list}, unbanned_in={unban_count} guild(s)."
+        )
+
+        whitelist_state = "added to" if added else "already on"
+        details = [
+            f"✅ `{target_user_id}` is now {whitelist_state} the global whitelist.",
+            f"Removed from master ban list: **{removed_from_master_list}**",
+            f"Federated unbans applied: **{unban_count}**",
+        ]
+        if unbanned_guilds:
+            details.append(f"Guilds unbanned: {', '.join(unbanned_guilds)}")
+
+        await interaction.followup.send("\n".join(details), ephemeral=True)
+
+    @app_commands.command(name="whitelist-remove", description="Removes a user ID from the global whitelist.")
+    @app_commands.describe(user_id="The Discord User ID to remove from the whitelist.")
+    @has_mod_role()
+    async def whitelist_remove(self, interaction: discord.Interaction, user_id: str):
+        if not await has_federated_mod_role(interaction):
+            return
+
+        if not user_id.isdigit():
+            await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID.", ephemeral=True)
+            return
+
+        target_user_id = int(user_id)
+        await interaction.response.defer(ephemeral=True)
+
+        removed = await data_manager.remove_whitelisted_user_id(target_user_id)
+        self.bot.config = data_manager.load_federation_config()
+
+        if removed:
+            logger.info(f"Moderator {interaction.user.name} removed {target_user_id} from the global whitelist.")
+            await interaction.followup.send(
+                f"✅ `{target_user_id}` has been removed from the global whitelist. Future syncs and federated bans can affect this user again.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"ℹ️ `{target_user_id}` was not on the global whitelist.",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="lookup", description="Looks up a user ID or username in the federated ban list.")
     @discord.app_commands.describe(query="The User ID or username to search for.")
     @has_mod_role()

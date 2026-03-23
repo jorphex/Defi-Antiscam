@@ -89,10 +89,11 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
     from ui.views import ScreeningView
     config = bot.config
     screening_started_at = datetime.now(timezone.utc)
+    is_whitelisted_user = data_manager.is_user_whitelisted(member.id, config)
 
     ban_data = await data_manager.db_get_ban(member.id)
-    
-    if ban_data:
+
+    if ban_data and not is_whitelisted_user:
         logger.info(f"SCREEN_MEMBER: Flagged {member.name} (Master List).")
         
         # In the DB, the column is 'reason', same as the JSON key
@@ -119,22 +120,23 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
         
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
 
-    federated_guild_ids = config.get("federated_guild_ids", [])
     found_bans = []
-    for other_guild_id in federated_guild_ids:
-        if other_guild_id == member.guild.id:
-            continue
-        other_guild = bot.get_guild(other_guild_id)
-        if not other_guild:
-            continue
-        try:
-            ban_entry = await other_guild.fetch_ban(member)
-            if ban_entry:
-                found_bans.append({"guild_name": other_guild.name, "reason": ban_entry.reason or "No reason provided."})
-        except discord.NotFound:
-            continue
-        except Exception as e:
-            logger.error(f"Error checking ban status for {member.name} in {other_guild.name}: {e}")
+    if not is_whitelisted_user:
+        federated_guild_ids = config.get("federated_guild_ids", [])
+        for other_guild_id in federated_guild_ids:
+            if other_guild_id == member.guild.id:
+                continue
+            other_guild = bot.get_guild(other_guild_id)
+            if not other_guild:
+                continue
+            try:
+                ban_entry = await other_guild.fetch_ban(member)
+                if ban_entry:
+                    found_bans.append({"guild_name": other_guild.name, "reason": ban_entry.reason or "No reason provided."})
+            except discord.NotFound:
+                continue
+            except Exception as e:
+                logger.error(f"Error checking ban status for {member.name} in {other_guild.name}: {e}")
 
     if found_bans:
         banned_in_servers = ", ".join([ban['guild_name'] for ban in found_bans])

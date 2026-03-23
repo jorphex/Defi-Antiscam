@@ -76,6 +76,7 @@ class BackgroundTasks(commands.Cog):
                 # Use a dict to ensure uniqueness within this specific sync session
                 unique_import_users = {}
                 bot_owner_id = self.bot.config.get("bot_owner_id", 0)
+                whitelisted_user_ids = data_manager.get_whitelisted_user_ids(self.bot.config)
 
                 # Step 2: Fetch RAW content (Unchanged logic, just updated data structure)
                 for file_path in jsonl_files:
@@ -101,6 +102,8 @@ class BackgroundTasks(commands.Cog):
                                 continue
 
                             user_id = str(user_id_raw)
+                            if int(user_id) in whitelisted_user_ids:
+                                continue
                             
                             # Skip if we already processed this ID in this loop
                             if user_id in unique_import_users:
