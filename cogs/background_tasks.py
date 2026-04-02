@@ -5,6 +5,7 @@ from discord.ext import commands, tasks
 import os
 import aiohttp
 import json
+import fnmatch
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -49,6 +50,7 @@ class BackgroundTasks(commands.Cog):
         summary_color = discord.Color.green()
         new_users_added_count = 0
         total_profiles_scanned = 0
+        bot_profiles_skipped = 0
         current_db_count = 0
 
         headers = {
@@ -66,9 +68,13 @@ class BackgroundTasks(commands.Cog):
                         return
                     files_data = await response.json()
                 
-                jsonl_files = [file['path'] for file in files_data if file['name'].endswith('.jsonl')]
+                jsonl_files = [
+                    file["path"]
+                    for file in files_data
+                    if fnmatch.fnmatch(file["name"], "master_part_*.jsonl")
+                ]
                 if not jsonl_files:
-                    logger.info("BACKGROUND TASK: No .jsonl files found in the repository.")
+                    logger.info("BACKGROUND TASK: No matching master_part_*.jsonl files found in the repository.")
                     return
                 
                 logger.info(f"BACKGROUND TASK: Found {len(jsonl_files)} files to process: {jsonl_files}")
@@ -94,9 +100,12 @@ class BackgroundTasks(commands.Cog):
                             continue
                         try:
                             profile = json.loads(line)
-                            user_data = profile.get("user", {})
-                            user_id_raw = user_data.get("id")
                             total_profiles_scanned += 1
+                            if profile.get("bot", False):
+                                bot_profiles_skipped += 1
+                                continue
+
+                            user_id_raw = profile.get("user_id")
 
                             if not user_id_raw:
                                 continue
@@ -109,19 +118,16 @@ class BackgroundTasks(commands.Cog):
                             if user_id in unique_import_users:
                                 continue
 
-                            bio_text = user_data.get("bio", "N/A")
-
-                            # <<< CHANGE: Create a tuple for the SQL insert >>>
                             # Tuple order: (user_id, username, reason, origin_id, origin_name, mod_id, timestamp, bio)
                             unique_import_users[user_id] = (
                                 user_id,
-                                user_data.get("username", "N/A"),
+                                profile.get("username") or profile.get("global_name") or "N/A",
                                 "Added via automated external list sync.",
                                 0, # origin_guild_id
                                 "External Import (imimim)", # origin_guild_name
                                 bot_owner_id, # initiating_moderator_id
                                 datetime.now(timezone.utc).isoformat(), # timestamp
-                                bio_text # bio_at_import
+                                "N/A" # bio_at_import
                             )
 
                         except json.JSONDecodeError:
@@ -140,6 +146,7 @@ class BackgroundTasks(commands.Cog):
 
                 summary_description = (
                     f"**Profiles Scanned:** `{total_profiles_scanned}`\n"
+                    f"**Bots Skipped:** `{bot_profiles_skipped}`\n"
                     f"**Pre-Sync Count:** `{existing_ban_count}`\n"
                     f"**New Users Added:** `{new_users_added_count}`"
                 )
