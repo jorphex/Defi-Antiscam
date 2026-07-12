@@ -52,3 +52,6 @@ The bot needs these permissions in any member server to function correctly:
 - Threshold Network
 - Icarus Finance
 - Ethereal
+- GridPlus
+- DataDash
+- Brilla Finance
