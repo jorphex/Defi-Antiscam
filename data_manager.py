@@ -394,10 +394,13 @@ def load_federation_config():
         if server.timeouts.delete_messages_days is not None:
             config["delete_messages_on_ban_days_per_guild"][guild_id_str] = server.timeouts.delete_messages_days
 
-        if server.roles.moderator:
-            config["moderator_roles_per_guild"][guild_id_str] = server.roles.moderator
-        if server.roles.whitelisted:
-            config["whitelisted_roles_per_guild"][guild_id_str] = server.roles.whitelisted
+        moderator_roles = list(server.roles.moderator)
+        if moderator_roles:
+            config["moderator_roles_per_guild"][guild_id_str] = moderator_roles
+
+        screening_exempt_roles = list(dict.fromkeys([*moderator_roles, *server.roles.whitelisted]))
+        if screening_exempt_roles:
+            config["whitelisted_roles_per_guild"][guild_id_str] = screening_exempt_roles
 
         if server.channels.action_alert is not None:
             config["action_alert_channels"][guild_id_str] = server.channels.action_alert
