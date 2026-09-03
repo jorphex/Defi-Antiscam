@@ -29,8 +29,9 @@ class RegexTestModal(discord.ui.Modal, title="Regex Test"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         text_to_test = self.sample_text.value
-        
+
         # Match against the original text, which mirrors production regex screening.
         match = self.compiled_regex.search(text_to_test)
         
@@ -44,12 +45,15 @@ class RegexTestModal(discord.ui.Modal, title="Regex Test"):
         # Show the original text so the user sees what they pasted
         embed.add_field(name="Original Sample Text", value=f"```{text_to_test}```", inline=False)
         # Regex screening does not normalize text; the original text is the source of truth.
-            
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         logger.error(f"Error in RegexTestModal: {error}", exc_info=True)
-        await interaction.response.send_message("An unexpected error occurred. Please check the logs.", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("An unexpected error occurred. Please check the logs.", ephemeral=True)
+        else:
+            await interaction.followup.send("An unexpected error occurred. Please check the logs.", ephemeral=True)
 
 class TestCurrentRegexModal(discord.ui.Modal, title="Test Against Current Regex"):
     def __init__(self):

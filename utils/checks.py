@@ -13,8 +13,9 @@ if TYPE_CHECKING:
 def is_bot_owner():
     """A check decorator to ensure the user is the bot's owner."""
     async def predicate(interaction: discord.Interaction) -> bool:
-        app_info = await interaction.client.application_info()
-        if interaction.user.id == app_info.owner.id:
+        bot: 'AntiScamBot' = interaction.client
+        owner_id = bot.config.get("bot_owner_id") or getattr(bot, "owner_id", None)
+        if owner_id and interaction.user.id == owner_id:
             return True
         await interaction.response.send_message("❌ This command can only be used by the bot owner.", ephemeral=True)
         return False
@@ -28,9 +29,9 @@ def has_mod_role():
     async def predicate(interaction: discord.Interaction) -> bool:
         bot: 'AntiScamBot' = interaction.client
         config = bot.config
-        
-        app_info = await bot.application_info()
-        if interaction.user.id == app_info.owner.id:
+
+        owner_id = config.get("bot_owner_id") or getattr(bot, "owner_id", None)
+        if owner_id and interaction.user.id == owner_id:
             return True
 
         if not interaction.guild:
@@ -53,23 +54,6 @@ def has_mod_role():
         return False
 
     return discord.app_commands.check(predicate)
-
-async def has_federated_mod_role(interaction: discord.Interaction) -> bool:
-    """Checks if the user has a whitelisted moderator role for the current guild."""
-    bot: 'AntiScamBot' = interaction.client
-    config = bot.config
-    
-    federated_guild_ids = config.get("federated_guild_ids", [])
-    if interaction.guild.id not in federated_guild_ids:
-        await interaction.response.send_message("❌ This command can only be used in a federated server.", ephemeral=True)
-        return False
-        
-    whitelisted_mod_roles = config.get("moderator_roles_per_guild", {}).get(str(interaction.guild.id), [])
-    user_role_ids = {role.id for role in interaction.user.roles}
-    if not any(role_id in whitelisted_mod_roles for role_id in user_role_ids):
-        await interaction.response.send_message("❌ You do not have the required role to use this command.", ephemeral=True)
-        return False
-    return True
 
 async def is_federated_moderator(bot: 'AntiScamBot', user_id_to_check: int) -> bool:
     """Checks if a user ID belongs to a moderator in ANY federated server concurrently."""
@@ -100,15 +84,19 @@ async def is_federated_moderator(bot: 'AntiScamBot', user_id_to_check: int) -> b
             logger.warning(f"Could not fetch member {user_id_to_check} in guild {guild.name} for is_federated_moderator check: {e}")
             return False
 
-    tasks = [check_guild(guild_id) for guild_id in config.get("federated_guild_ids", [])]
-    
-    for future in asyncio.as_completed(tasks):
-        result = await future
-        if result:
-            logger.info(f"is_federated_moderator check PASSED for {user_id_to_check}.")
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            return True
-    
-    return False
+    tasks = [
+        asyncio.create_task(check_guild(guild_id))
+        for guild_id in config.get("federated_guild_ids", [])
+    ]
+
+    try:
+        for future in asyncio.as_completed(tasks):
+            if await future:
+                logger.info(f"is_federated_moderator check PASSED for {user_id_to_check}.")
+                return True
+        return False
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

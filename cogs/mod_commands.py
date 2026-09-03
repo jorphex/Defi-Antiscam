@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import data_manager
 import screening_handler
 from ui.views import ConfirmScanView, RegexTestModal, OnboardView, ConfirmGlobalBanView, AlreadyBannedView, ConfirmGlobalUnbanView, LookupPaginatorView, TestCurrentRegexModal, ConfirmMassBanView, ConfirmMassKickView, ConfirmRegexEditView
-from utils.checks import has_mod_role, has_federated_mod_role, is_federated_moderator
+from utils.checks import has_mod_role, is_federated_moderator
 from utils.command_helpers import (
     format_keyword_list, add_keyword_to_list, add_regex_to_list,
     remove_keyword_from_list, remove_regex_from_list_by_id
@@ -79,8 +79,6 @@ class ModCommands(commands.Cog):
     @app_commands.command(name="stats", description="Displays local and federated ban statistics.")
     @has_mod_role()
     async def stats(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer()
         stats = await data_manager.load_fed_stats()
         guild_id_str = str(interaction.guild.id)
@@ -105,8 +103,6 @@ class ModCommands(commands.Cog):
     @app_commands.command(name="list-keywords", description="Lists all active screening keywords for this server.")
     @has_mod_role()
     async def list_keywords(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
 
         keywords_data = await data_manager.load_keywords()
@@ -130,8 +126,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="Example: 'admin' will match 'listadaoadmin' or 'admin123'.")
     async def add_username_keyword_substring(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         await add_keyword_to_list(interaction, keyword, "username_keywords", "substring")
 
@@ -139,8 +133,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="Example: 'mod' will match 'mod123' but IGNORE 'modern'.")
     async def add_username_keyword_smart(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         await add_keyword_to_list(interaction, keyword, "username_keywords", "smart")
 
@@ -148,8 +140,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="The keyword or phrase to add (e.g., 'dm me for help').")
     async def add_bio_keyword(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         await add_keyword_to_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
 
@@ -157,9 +147,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @app_commands.describe(pattern="The regex pattern to test. Remember to escape special characters (e.g., '\\.').")
     async def test_new_regex(self, interaction: discord.Interaction, pattern: str):
-        if not await has_federated_mod_role(interaction):
-            return
-
         try:
             compiled_regex = re.compile(pattern)
         except re.error as e:
@@ -172,9 +159,6 @@ class ModCommands(commands.Cog):
     @app_commands.command(name="test-current-regex", description="Tests sample text against all current regex patterns using a pop-up box.")
     @has_mod_role()
     async def test_current_regex(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction):
-            return
-        
         modal = TestCurrentRegexModal()
         await interaction.response.send_modal(modal)
 
@@ -182,8 +166,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(pattern="The exact regex pattern. Use standard regex escaping (e.g., '\\.' for a dot, '\\s' for whitespace).")
     async def add_local_regex(self, interaction: discord.Interaction, pattern: str):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         await add_regex_to_list(interaction, pattern, is_global=False)
 
@@ -191,8 +173,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="The exact keyword to remove.")
     async def remove_username_keyword_substring(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         await remove_keyword_from_list(interaction, keyword, "username_keywords", "substring")
 
@@ -200,8 +180,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="The exact keyword to remove.")
     async def remove_username_keyword_smart(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         await remove_keyword_from_list(interaction, keyword, "username_keywords", "smart")
 
@@ -209,8 +187,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(keyword="The exact keyword or phrase to remove.")
     async def remove_bio_keyword(self, interaction: discord.Interaction, keyword: str):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         await remove_keyword_from_list(interaction, keyword, "bio_and_message_keywords", "simple_keywords")
 
@@ -218,8 +194,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(index="The numerical ID of the regex pattern to remove.")
     async def remove_local_regex_by_id(self, interaction: discord.Interaction, index: int):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         await remove_regex_from_list_by_id(interaction, index, is_global=False)
 
@@ -227,8 +201,6 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(index="The numerical ID of the regex pattern to edit.", pattern="The new regex pattern.")
     async def edit_local_regex_by_id(self, interaction: discord.Interaction, index: int, pattern: str):
-        if not await has_federated_mod_role(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
 
         if index <= 0:
@@ -274,8 +246,6 @@ class ModCommands(commands.Cog):
     @app_commands.command(name="scanallmembers", description="Retroactively scans all server members against the screening list.")
     @has_mod_role()
     async def scanallmembers(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction):
-            return
         if interaction.guild.id in self.bot.active_scans:
             await interaction.response.send_message("❌ A scan is already in progress for this server.", ephemeral=True)
             return
@@ -295,8 +265,6 @@ class ModCommands(commands.Cog):
     @app_commands.command(name="stopscan", description="Stops an ongoing member scan for this server.")
     @has_mod_role()
     async def stopscan(self, interaction: discord.Interaction):
-        if not await has_federated_mod_role(interaction):
-            return
         guild_id = interaction.guild.id
         if guild_id in self.bot.active_scans:
             self.bot.active_scans[guild_id].cancel()
@@ -309,13 +277,12 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(message="Your message, feedback, or request for the bot maintainer.")
     async def contact_maintainer(self, interaction: discord.Interaction, message: str):
+        await interaction.response.defer(ephemeral=True)
         config = self.bot.config
-        if not await has_federated_mod_role(interaction):
-            return
 
         log_channel_id = config.get("log_channel_id")
         if not log_channel_id:
-            await interaction.response.send_message("❌ The bot's log channel is not configured. Please contact the owner directly.", ephemeral=True)
+            await interaction.followup.send("❌ The bot's log channel is not configured. Please contact the owner directly.", ephemeral=True)
             return
 
         log_channel = self.bot.get_channel(log_channel_id)
@@ -323,13 +290,13 @@ class ModCommands(commands.Cog):
             try:
                 log_channel = await self.bot.fetch_channel(log_channel_id)
             except (discord.NotFound, discord.Forbidden):
-                await interaction.response.send_message("❌ Could not find or access the bot's log channel. Please contact the owner directly.", ephemeral=True)
+                await interaction.followup.send("❌ Could not find or access the bot's log channel. Please contact the owner directly.", ephemeral=True)
                 logger.error(f"Could not fetch log channel {log_channel_id} for contact-admin command.")
                 return
 
         bot_owner_id = config.get("bot_owner_id")
         if not bot_owner_id:
-            await interaction.response.send_message("❌ The bot owner's ID is not configured. Cannot send notification.", ephemeral=True)
+            await interaction.followup.send("❌ The bot owner's ID is not configured. Cannot send notification.", ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -345,19 +312,20 @@ class ModCommands(commands.Cog):
 
         try:
             await log_channel.send(content=f"<@{bot_owner_id}>", embed=embed)
-            await interaction.response.send_message("✅ Your message has been successfully sent to the bot maintainer.", ephemeral=True)
+            await interaction.followup.send("✅ Your message has been successfully sent to the bot maintainer.", ephemeral=True)
             logger.info(f"Moderator {interaction.user.name} from {interaction.guild.name} sent an admin contact request.")
         except Exception as e:
-            await interaction.response.send_message("❌ An error occurred while trying to send your message. Please try again later.", ephemeral=True)
+            await interaction.followup.send("❌ An error occurred while trying to send your message. Please try again later.", ephemeral=True)
             logger.error(f"Failed to send contact message to log channel: {e}", exc_info=True)
 
     @app_commands.command(name="onboard-server", description="Onboards a new server by syncing the federated ban list.")
     @has_mod_role()
     async def onboard_server(self, interaction: discord.Interaction):
+        await interaction.response.defer()
 
         sync_status = await data_manager.load_sync_status()
         if interaction.guild.id in sync_status["synced_guild_ids"]:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ **Action Prohibited:** This server has already been onboarded. "
                 "Running this command again could incorrectly re-ban users who were locally unbanned. "
                 "If a full re-sync is required, please contact the bot maintainer.",
@@ -371,7 +339,7 @@ class ModCommands(commands.Cog):
         ban_count = len(all_bans)
 
         if ban_count == 0:
-            await interaction.response.send_message("ℹ️ The federated ban list is currently empty. No onboarding action is needed.", ephemeral=True)
+            await interaction.followup.send("ℹ️ The federated ban list is currently empty. No onboarding action is needed.", ephemeral=True)
             return
 
         welcome_embed = discord.Embed(
@@ -434,7 +402,7 @@ class ModCommands(commands.Cog):
         welcome_embed.set_footer(text="❗️ This cannot be undone.")
 
         view = OnboardView(self.bot, interaction.user, all_bans)
-        await interaction.response.send_message(embed=welcome_embed, view=view)
+        await interaction.followup.send(embed=welcome_embed, view=view)
 
     @app_commands.command(name="mass-kick", description="Kicks multiple users from THIS SERVER by ID.")
     @app_commands.describe(
@@ -543,49 +511,48 @@ class ModCommands(commands.Cog):
     @has_mod_role()
     @discord.app_commands.describe(user_id="The Discord User ID of the person to ban.", reason="The reason for the ban. This will be shown in all federated alerts.")
     async def global_ban(self, interaction: discord.Interaction, user_id: str, reason: str):
+        await interaction.response.defer(ephemeral=True)
         config = self.bot.config
-        if not await has_federated_mod_role(interaction):
-            return
 
         if not user_id.isdigit():
-            await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID (numbers only).", ephemeral=True)
+            await interaction.followup.send("❌ **Invalid ID:** Please provide a valid Discord User ID (numbers only).", ephemeral=True)
             return
     
         target_user_id = int(user_id)
 
         if target_user_id == interaction.user.id:
-            await interaction.response.send_message("❌ You cannot ban yourself.", ephemeral=True)
+            await interaction.followup.send("❌ You cannot ban yourself.", ephemeral=True)
             return
-    
+
         if target_user_id == self.bot.user.id:
-            await interaction.response.send_message("❌ I cannot ban myself.", ephemeral=True)
+            await interaction.followup.send("❌ I cannot ban myself.", ephemeral=True)
             return
 
         try:
             user_to_ban = await self.bot.fetch_user(target_user_id)
         except discord.NotFound:
-            await interaction.response.send_message(f"❌ **User Not Found:** No user exists with the ID `{target_user_id}`.", ephemeral=True)
+            await interaction.followup.send(f"❌ **User Not Found:** No user exists with the ID `{target_user_id}`.", ephemeral=True)
             return
         except Exception as e:
-            await interaction.response.send_message(f"❌ An error occurred while fetching the user: `{e}`", ephemeral=True)
+            await interaction.followup.send(f"❌ An error occurred while fetching the user: `{e}`", ephemeral=True)
             logger.error(f"Failed to fetch user for global-ban command: {e}", exc_info=True)
             return
 
         if user_to_ban.bot:
-            await interaction.response.send_message("❌ **Action Prohibited:** You cannot target a bot account with this command.", ephemeral=True)
+            await interaction.followup.send("❌ **Action Prohibited:** You cannot target a bot account with this command.", ephemeral=True)
             return
 
         bot_owner_id = config.get("bot_owner_id")
         if bot_owner_id and user_to_ban.id == bot_owner_id:
-            await interaction.response.send_message("❌ **Action Prohibited:** You cannot target the bot owner.", ephemeral=True)
+            await interaction.followup.send("❌ **Action Prohibited:** You cannot target the bot owner.", ephemeral=True)
             return
 
         if await is_federated_moderator(self.bot, user_to_ban.id):
-            await interaction.response.send_message("❌ **Action Prohibited:** You cannot target another federated moderator. This action must be performed manually by the bot owner if necessary.", ephemeral=True)
+            await interaction.followup.send("❌ **Action Prohibited:** You cannot target another federated moderator. This action must be performed manually by the bot owner if necessary.", ephemeral=True)
             return
 
         if data_manager.is_user_whitelisted(user_to_ban.id, config):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ **Action Prohibited:** This user is on the global whitelist and cannot be added to the federated ban list.",
                 ephemeral=True,
             )
@@ -603,7 +570,7 @@ class ModCommands(commands.Cog):
                 "Do you want to apply the ban in this server anyway?"
             )
             view = AlreadyBannedView(self.bot, interaction.user, user_to_ban, reason)
-            await interaction.response.send_message(response_text, view=view, ephemeral=True)
+            await interaction.followup.send(response_text, view=view, ephemeral=True)
             return
     
         confirm_embed = discord.Embed(
@@ -615,14 +582,16 @@ class ModCommands(commands.Cog):
         confirm_embed.add_field(name="Reason", value=f"```{reason}```", inline=False)
 
         view = ConfirmGlobalBanView(self.bot, interaction.user, user_to_ban, reason)
-        await interaction.response.send_message(embed=confirm_embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=confirm_embed, view=view, ephemeral=True)
 
     @app_commands.command(name="global-unban", description="Proactively unbans a user by ID across all federated servers.")
     @app_commands.describe(user_id="The Discord User ID of the person to unban.", reason="The reason for the unban.")
     @has_mod_role()
     async def global_unban(self, interaction: discord.Interaction, user_id: str, reason: str):
+        await interaction.response.defer(ephemeral=True)
+
         if not user_id.isdigit():
-            await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID.", ephemeral=True)
+            await interaction.followup.send("❌ **Invalid ID:** Please provide a valid Discord User ID.", ephemeral=True)
             return
         
         target_user_id = int(user_id)
@@ -630,7 +599,7 @@ class ModCommands(commands.Cog):
         # Safety check: Is the user actually on the ban list?
         existing_ban = await data_manager.db_get_ban(user_id)
         if not existing_ban:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"ℹ️ **Action Not Needed:** The user with ID `{user_id}` is not on the master federated ban list.",
                 ephemeral=True
             )
@@ -645,14 +614,14 @@ class ModCommands(commands.Cog):
             user_to_unban.name = existing_ban.get("username", f"ID: {user_id}")
             user_to_unban.display_avatar = None
         except Exception as e:
-            await interaction.response.send_message(f"❌ An error occurred while fetching the user: `{e}`", ephemeral=True)
+            await interaction.followup.send(f"❌ An error occurred while fetching the user: `{e}`", ephemeral=True)
             logger.error(f"Failed to fetch user for global-unban command: {e}", exc_info=True)
             return
 
         # Another safety check
         bot_owner_id = self.bot.config.get("bot_owner_id")
         if bot_owner_id and user_to_unban.id == bot_owner_id:
-            await interaction.response.send_message("❌ **Action Prohibited:** The bot owner must be unbanned manually by themself in each server.", ephemeral=True)
+            await interaction.followup.send("❌ **Action Prohibited:** The bot owner must be unbanned manually by themself in each server.", ephemeral=True)
             return
 
         confirm_embed = discord.Embed(
@@ -667,15 +636,12 @@ class ModCommands(commands.Cog):
         confirm_embed.add_field(name="Reason", value=f"```{reason}```", inline=False)
 
         view = ConfirmGlobalUnbanView(self.bot, interaction.user, user_to_unban, reason)
-        await interaction.response.send_message(embed=confirm_embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=confirm_embed, view=view, ephemeral=True)
 
     @app_commands.command(name="whitelist-add", description="Adds a user ID to the global whitelist and removes existing federated bans.")
     @app_commands.describe(user_id="The Discord User ID to whitelist.")
     @has_mod_role()
     async def whitelist_add(self, interaction: discord.Interaction, user_id: str):
-        if not await has_federated_mod_role(interaction):
-            return
-
         if not user_id.isdigit():
             await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID.", ephemeral=True)
             return
@@ -721,9 +687,6 @@ class ModCommands(commands.Cog):
     @app_commands.describe(user_id="The Discord User ID to remove from the whitelist.")
     @has_mod_role()
     async def whitelist_remove(self, interaction: discord.Interaction, user_id: str):
-        if not await has_federated_mod_role(interaction):
-            return
-
         if not user_id.isdigit():
             await interaction.response.send_message("❌ **Invalid ID:** Please provide a valid Discord User ID.", ephemeral=True)
             return
