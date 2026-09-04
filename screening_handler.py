@@ -24,6 +24,82 @@ PROFILE_FETCH_TIMEOUT_SECONDS = 3
 MAX_TRIGGER_FIELD_LENGTH = 1000
 
 
+def get_member_identity_names(
+    member: discord.Member,
+    profile: discord.abc.User | None = None,
+) -> list[str]:
+    """Return every user-controlled name that Discord may show for a member."""
+    identity_source = profile or member
+    username = getattr(identity_source, "name", None) or member.name
+    global_name = getattr(identity_source, "global_name", None)
+    nickname = member.nick
+
+    return list(dict.fromkeys(name for name in (username, global_name, nickname) if name))
+
+
+def format_member_identity_context(
+    member: discord.Member,
+    profile: discord.abc.User | None = None,
+) -> str:
+    """Format all Discord name fields for moderator and AI review context."""
+    identity_source = profile or member
+    username = getattr(identity_source, "name", None) or member.name
+    global_name = getattr(identity_source, "global_name", None) or "None"
+    nickname = member.nick or "None"
+    return f"Username: {username}\nGlobal display name: {global_name}\nServer nickname: {nickname}"
+
+
+def get_member_name_triggers(
+    member: discord.Member,
+    keywords_data: dict,
+    profile: discord.abc.User | None = None,
+) -> list[str]:
+    """Check every Discord name field against local and global username rules."""
+    local_rules = keywords_data.get("per_server_keywords", {}).get(str(member.guild.id), {})
+    global_rules = keywords_data.get("global_keywords", {})
+
+    triggered_keywords = []
+    for name in get_member_identity_names(member, profile):
+        triggered_keywords.extend(check_text_for_keywords(name, local_rules.get("username_keywords", {})))
+        triggered_keywords.extend(check_text_for_keywords(name, global_rules.get("username_keywords", {})))
+    return list(dict.fromkeys(triggered_keywords))
+
+
+def _build_keyword_screening_result(
+    member: discord.Member,
+    triggered_keywords: list[str],
+    profile: discord.abc.User | None = None,
+    bio: str = "",
+) -> dict:
+    identity_source = profile or member
+    display_name = member.nick or getattr(identity_source, "global_name", None) or identity_source.name
+    embed = discord.Embed(
+        title="🚨 Flagged User",
+        description=f"{member.mention} (`{member.id}`)",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name=display_name, icon_url=member.display_avatar.url)
+    if bio:
+        embed.add_field(name="📝 Bio", value=bio[:1024], inline=False)
+    embed.add_field(name="🚩 Trigger", value=f"`{_format_trigger_value(triggered_keywords)}`", inline=True)
+    embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
+    embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+    return {"flagged": True, "embed": embed, "timeout_reason": "Flagged by keyword screening."}
+
+
+def screen_member_name_change(
+    member: discord.Member,
+    keywords_data: dict,
+    profile: discord.abc.User | None = None,
+) -> dict:
+    """Screen only mutable Discord name fields after a profile or nickname update."""
+    triggered_keywords = get_member_name_triggers(member, keywords_data, profile)
+    if not triggered_keywords:
+        return {"flagged": False}
+    return _build_keyword_screening_result(member, triggered_keywords, profile)
+
+
 def _add_screening_latency(embed: discord.Embed, started_at: datetime) -> None:
     elapsed_ms = max(int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000), 0)
     embed.add_field(name="⏱️ Screening Latency", value=f"`{elapsed_ms} ms`", inline=True)
@@ -82,7 +158,12 @@ def check_for_flood(bot: 'AntiScamBot', message: discord.Message) -> bool:
 
     return False
 
-async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_data: dict) -> dict:
+async def screen_member(
+    bot: 'AntiScamBot',
+    member: discord.Member,
+    keywords_data: dict,
+    profile: discord.abc.User | None = None,
+) -> dict:
     """
     Performs the complete screening process for a single member.
     """
@@ -188,17 +269,17 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
 
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
 
-    fetched_profile = None
-    user_profile = member
-    bio = ""
-    try:
-        fetched_profile = await bot.fetch_user(member.id)
-        user_profile = fetched_profile
-        bio = getattr(fetched_profile, 'bio', "")
-    except discord.NotFound:
-        logger.warning(f"Could not fetch profile for {member.name} ({member.id}) during screening, user may no longer exist. Proceeding without bio check.")
-    except Exception as e:
-        logger.error(f"Could not fetch profile for {member.name} ({member.id}) to get bio. Proceeding without it. Error: {e}")
+    fetched_profile = profile
+    if fetched_profile is None:
+        try:
+            fetched_profile = await bot.fetch_user(member.id)
+        except discord.NotFound:
+            logger.warning(f"Could not fetch profile for {member.name} ({member.id}) during screening, user may no longer exist. Proceeding without bio check.")
+        except Exception as e:
+            logger.error(f"Could not fetch profile for {member.name} ({member.id}) to get bio. Proceeding without it. Error: {e}")
+
+    user_profile = fetched_profile or member
+    bio = getattr(user_profile, 'bio', "")
 
     identity_result = await check_server_identity(bot, member, profile=fetched_profile)
     if identity_result.get("flagged"):
@@ -215,14 +296,11 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
         embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
         _add_screening_latency(embed, screening_started_at)
         return {"flagged": True, "embed": embed, "timeout_reason": timeout_reason}
-    triggered_keywords = []
-    name_text = f"{user_profile.name} {member.nick or ''}"
-    
+    triggered_keywords = get_member_name_triggers(member, keywords_data, user_profile)
+
     local_rules = keywords_data.get("per_server_keywords", {}).get(str(member.guild.id), {})
     global_rules = keywords_data.get("global_keywords", {})
 
-    triggered_keywords.extend(check_text_for_keywords(name_text, local_rules.get("username_keywords", {})))
-    triggered_keywords.extend(check_text_for_keywords(name_text, global_rules.get("username_keywords", {})))
     if bio:
         triggered_keywords.extend(
             check_text_for_keywords(
@@ -240,16 +318,9 @@ async def screen_member(bot: 'AntiScamBot', member: discord.Member, keywords_dat
         )
 
     if triggered_keywords:
-        timeout_reason = "Flagged by keyword screening."
-        embed = discord.Embed(title="🚨 Flagged User", description=f"{member.mention} (`{member.id}`)", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
-        embed.set_author(name=f"{member.name}", icon_url=member.display_avatar.url)
-        if bio:
-            embed.add_field(name="📝 Bio", value=bio[:1024], inline=False)
-        embed.add_field(name="🚩 Trigger", value=f"`{_format_trigger_value(triggered_keywords)}`", inline=True)
-        embed.add_field(name="Status", value="User timed out. Awaiting review...", inline=True)
-        embed.add_field(name="Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
-        _add_screening_latency(embed, screening_started_at)
-        return {"flagged": True, "embed": embed, "timeout_reason": "Flagged by keyword screening."}
+        result = _build_keyword_screening_result(member, triggered_keywords, user_profile, bio)
+        _add_screening_latency(result["embed"], screening_started_at)
+        return result
 
     return {"flagged": False}
 
@@ -646,15 +717,23 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
 
                     if gemini_is_available and llm_config.get("automation_mode", "off") != "off":
                         # AI-powered workflow for the scan
-                        bio = getattr(await bot.fetch_user(member.id), 'bio', "")
+                        try:
+                            profile = await bot.fetch_user(member.id)
+                        except Exception as e:
+                            logger.warning(
+                                f"Could not refresh profile context for {member.id} during full scan: {e}"
+                            )
+                            profile = member
+                        bio = getattr(profile, 'bio', "")
+                        identity_context = format_member_identity_context(member, profile)
                         bot.loop.create_task(llm_handler.start_llm_analysis_task(
                             bot=bot,
                             alert_channel=results_channel,
                             embed=embed,
                             view=view,
                             flagged_member=member,
-                            content_type="Bio/Username (Scan)",
-                            content=f"Username: {member.name}\nNick: {member.nick}\nBio: {bio}",
+                            content_type="Bio/Identity (Scan)",
+                            content=f"{identity_context}\nBio: {bio}",
                             trigger=result.get("timeout_reason")
                         ))
                     else:

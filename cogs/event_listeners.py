@@ -47,6 +47,113 @@ class EventListeners(commands.Cog):
     async def on_guild_join(self, guild: discord.Guild):
         logger.info(f"Joined new guild: {guild.name} ({guild.id}). Setting up command permissions.")
 
+    async def _screen_and_enforce_member(
+        self,
+        member: discord.Member,
+        *,
+        source: str,
+        profile: discord.abc.User | None = None,
+        name_change_only: bool = False,
+    ) -> bool:
+        """Run member screening and the shared timeout/alert workflow."""
+        config = self.bot.config
+        bot_owner_id = config.get("bot_owner_id")
+        if member.bot or (bot_owner_id and member.id == bot_owner_id):
+            return False
+
+        if member.guild.id not in config.get("federated_guild_ids", []):
+            return False
+
+        whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(member.guild.id), [])
+        if any(role.id in whitelisted_roles for role in member.roles):
+            logger.info(f"Member {member.name} has a whitelisted role. Skipping {source} screen.")
+            return False
+
+        try:
+            keywords_data = await data_manager.load_keywords()
+            if not keywords_data:
+                logger.error(f"Could not load keywords for {source} screen. Aborting check.")
+                return False
+
+            if name_change_only:
+                result = screening_handler.screen_member_name_change(member, keywords_data, profile)
+            else:
+                result = await screening_handler.screen_member(self.bot, member, keywords_data, profile)
+        except Exception as e:
+            logger.error(f"Failed to screen {member.name} after {source} in {member.guild.name}: {e}", exc_info=True)
+            return False
+
+        display_name = member.nick or getattr(profile or member, "global_name", None) or member.name
+        if not result.get("flagged"):
+            logger.info(f"Member {display_name} in {member.guild.name} passed {source} screening.")
+            return False
+
+        logger.info(f"FLAGGED member after {source}: {display_name} in {member.guild.name}.")
+        try:
+            timeout_minutes = get_timeout_minutes_for_guild(self.bot, member.guild)
+            await member.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason"))
+        except Exception as e:
+            logger.error(f"Failed to timeout flagged member {display_name}: {e}", exc_info=True)
+
+        if result.get("automated_action_pending"):
+            logger.info(
+                f"Member {display_name} in {member.guild.name} flagged as 'Banned Elsewhere'. "
+                "Automated ban is pending after timeout."
+            )
+
+        if result.get("skip_alert_dispatch"):
+            return True
+
+        mod_channel_id = config.get("action_alert_channels", {}).get(str(member.guild.id))
+        alert_channel = member.guild.get_channel(mod_channel_id) if mod_channel_id else None
+        if not alert_channel:
+            logger.warning(
+                "Flagged member %s (%s) was timed out in %s after %s, but no alert channel is configured or accessible.",
+                display_name,
+                member.id,
+                member.guild.name,
+                source,
+            )
+            return True
+
+        try:
+            view = ScreeningView(flagged_member_id=member.id)
+            embed = result.get("embed")
+            if name_change_only:
+                embed.add_field(name="Detection Source", value=source.title(), inline=True)
+            embed.set_footer(text=f"User ID: {member.id}")
+
+            guild_id_str = str(member.guild.id)
+            llm_defaults = config.get("llm_settings", {}).get("defaults", {})
+            llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
+
+            if self.gemini_is_available and llm_config.get("automation_mode", "off") != "off":
+                analysis_profile = profile
+                try:
+                    analysis_profile = await self.bot.fetch_user(member.id)
+                except Exception as e:
+                    logger.warning(f"Could not refresh profile context for {member.id} after {source}: {e}")
+
+                bio = getattr(analysis_profile, "bio", "") if analysis_profile else ""
+                identity_context = screening_handler.format_member_identity_context(member, analysis_profile)
+                self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
+                    bot=self.bot,
+                    alert_channel=alert_channel,
+                    embed=embed,
+                    view=view,
+                    flagged_member=member,
+                    content_type="Bio/Identity",
+                    content=f"{identity_context}\nBio: {bio}",
+                    trigger=result.get("timeout_reason")
+                ))
+            else:
+                allowed_mentions = discord.AllowedMentions(users=[member])
+                await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
+        except Exception as e:
+            logger.error(f"Failed to send alert for {display_name} after {source}: {e}", exc_info=True)
+
+        return True
+
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         config = self.bot.config
@@ -65,74 +172,48 @@ class EventListeners(commands.Cog):
             logger.warning(f"Member {member.name} left before they could be processed.")
             return
 
-        whitelisted_roles = config.get("whitelisted_roles_per_guild", {}).get(str(full_member.guild.id), [])
-        if any(role.id in whitelisted_roles for role in full_member.roles):
-            logger.info(f"Member {full_member.name} has a whitelisted role. Skipping screen.")
+        await self._screen_and_enforce_member(full_member, source="join")
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        if before.nick == after.nick:
+            return
+        await self._screen_and_enforce_member(
+            after,
+            source="server nickname change",
+            profile=after,
+            name_change_only=True,
+        )
+
+    @commands.Cog.listener()
+    async def on_user_update(self, before: discord.User, after: discord.User):
+        if before.name == after.name and before.global_name == after.global_name:
             return
 
-        keywords_data = await data_manager.load_keywords()
-        if not keywords_data:
-            logger.error("Could not load keywords for on_member_join screen. Aborting check.")
+        config = self.bot.config
+        bot_owner_id = config.get("bot_owner_id")
+        if after.bot or (bot_owner_id and after.id == bot_owner_id):
             return
 
-        result = await screening_handler.screen_member(self.bot, full_member, keywords_data)
-
-        if result.get("flagged"):
-            logger.info(f"FLAGGED member on join: {full_member.name} in {full_member.guild.name}.")
-            try:
-                timeout_minutes = get_timeout_minutes_for_guild(self.bot, full_member.guild)
-                await full_member.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason"))
-            except Exception as e:
-                logger.error(f"Failed to timeout flagged member {full_member.name}: {e}", exc_info=True)
-
-            if result.get("automated_action_pending"):
-                logger.info(
-                    f"Member {full_member.name} in {full_member.guild.name} flagged as 'Banned Elsewhere'. "
-                    "Automated ban is pending after timeout."
+        tasks = []
+        federated_guild_ids = set(config.get("federated_guild_ids", []))
+        for guild in self.bot.guilds:
+            if guild.id not in federated_guild_ids:
+                continue
+            member = guild.get_member(after.id)
+            if member is None:
+                continue
+            tasks.append(
+                self._screen_and_enforce_member(
+                    member,
+                    source="account name change",
+                    profile=after,
+                    name_change_only=True,
                 )
+            )
 
-            if result.get("skip_alert_dispatch"):
-                return
-
-            mod_channel_id = config.get("action_alert_channels", {}).get(str(full_member.guild.id))
-            alert_channel = full_member.guild.get_channel(mod_channel_id) if mod_channel_id else None
-            if not alert_channel:
-                logger.warning(
-                    "Flagged member %s (%s) was timed out in %s, but no alert channel is configured or accessible.",
-                    full_member.name,
-                    full_member.id,
-                    full_member.guild.name,
-                )
-                return
-
-            try:
-                view = ScreeningView(flagged_member_id=full_member.id)
-                embed = result.get("embed")
-                embed.set_footer(text=f"User ID: {full_member.id}")
-
-                guild_id_str = str(full_member.guild.id)
-                llm_defaults = config.get("llm_settings", {}).get("defaults", {})
-                llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
-
-                if self.gemini_is_available and llm_config.get("automation_mode", "off") != "off":
-                    bio = getattr(await self.bot.fetch_user(full_member.id), 'bio', "")
-                    self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
-                        bot=self.bot,
-                        alert_channel=alert_channel,
-                        embed=embed,
-                        view=view,
-                        flagged_member=full_member,
-                        content_type="Bio/Username",
-                        content=f"Username: {full_member.name}\nNick: {full_member.nick}\nBio: {bio}",
-                        trigger=result.get("timeout_reason")
-                    ))
-                else:
-                    allowed_mentions = discord.AllowedMentions(users=[full_member])
-                    await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
-            except Exception as e:
-                logger.error(f"Failed to take action on flagged member {full_member.name}: {e}", exc_info=True)
-        else:
-            logger.info(f"Member {full_member.name} in {full_member.guild.name} passed all screenings.")
+        if tasks:
+            await asyncio.gather(*tasks)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
