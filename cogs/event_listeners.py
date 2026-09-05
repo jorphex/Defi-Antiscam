@@ -27,7 +27,7 @@ class EventListeners(commands.Cog):
     async def on_ready(self):
         logger.info(f'{self.bot.user.name} has connected to Discord!')
 
-        self.gemini_is_available = llm_handler.initialize_gemini()
+        self.gemini_is_available = llm_handler.initialize_gemini(self.bot)
         if self.gemini_is_available:
             logger.info("Gemini client initialized successfully.")
 
@@ -128,15 +128,10 @@ class EventListeners(commands.Cog):
             llm_config = config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
 
             if self.gemini_is_available and llm_config.get("automation_mode", "off") != "off":
-                analysis_profile = profile
-                try:
-                    analysis_profile = await self.bot.fetch_user(member.id)
-                except Exception as e:
-                    logger.warning(f"Could not refresh profile context for {member.id} after {source}: {e}")
-
-                bio = getattr(analysis_profile, "bio", "") if analysis_profile else ""
+                analysis_profile = profile or member
+                bio = next((field.value for field in embed.fields if "Bio" in field.name), "")
                 identity_context = screening_handler.format_member_identity_context(member, analysis_profile)
-                self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
+                llm_handler.schedule_analysis(
                     bot=self.bot,
                     alert_channel=alert_channel,
                     embed=embed,
@@ -145,7 +140,7 @@ class EventListeners(commands.Cog):
                     content_type="Bio/Identity",
                     content=f"{identity_context}\nBio: {bio}",
                     trigger=result.get("timeout_reason")
-                ))
+                )
             else:
                 allowed_mentions = discord.AllowedMentions(users=[member])
                 await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
@@ -292,7 +287,7 @@ class EventListeners(commands.Cog):
             if content_result.get("flagged"):
                 result = content_result
             else:
-                author_id = message.author.id
+                author_id = (message.guild.id, message.author.id)
                 current_time = datetime.now(timezone.utc)
                 
                 if author_id not in self.bot.bio_check_cache or \
@@ -342,16 +337,16 @@ class EventListeners(commands.Cog):
                         content = message.content
                         if "Bio" in embed.title:
                             content_type = "Bio"
-                            bio = getattr(await self.bot.fetch_user(author.id), 'bio', "")
+                            bio = next((field.value for field in embed.fields if "Bio" in field.name), "")
                             content = bio
                         elif "Flood" in embed.title:
                             content_type = "Message (Flood)"
 
-                        self.bot.loop.create_task(llm_handler.start_llm_analysis_task(
+                        llm_handler.schedule_analysis(
                             bot=self.bot, alert_channel=alert_channel, embed=embed, view=view,
                             flagged_member=author, content_type=content_type, content=content,
                             trigger=result.get("timeout_reason")
-                        ))
+                        )
                     else:
                         allowed_mentions = discord.AllowedMentions(users=[author])
                         await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
@@ -438,6 +433,8 @@ class EventListeners(commands.Cog):
         config = self.bot.config
         if guild.id not in config.get("federated_guild_ids", []):
             return
+
+        await data_manager.record_onboarding_unban(guild.id, user.id)
 
         await asyncio.sleep(2)
         try:

@@ -7,6 +7,7 @@ import asyncio
 import discord
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit
 from unidecode import unidecode
 from typing import TYPE_CHECKING
 
@@ -158,6 +159,22 @@ def check_for_flood(bot: 'AntiScamBot', message: discord.Message) -> bool:
 
     return False
 
+def prune_screening_caches(bot: 'AntiScamBot') -> None:
+    now = datetime.now(timezone.utc)
+    for key, checked_at in list(bot.bio_check_cache.items()):
+        if (now - checked_at).total_seconds() >= 300:
+            del bot.bio_check_cache[key]
+    window = timedelta(seconds=bot.config.get("flood_detection", {}).get("time_window_seconds", 5))
+    for guild_id, users in list(bot.message_history.items()):
+        for user_id, history in list(users.items()):
+            while history and now - history[0][0] > window:
+                history.popleft()
+            if not history:
+                del users[user_id]
+        if not users:
+            del bot.message_history[guild_id]
+
+
 async def screen_member(
     bot: 'AntiScamBot',
     member: discord.Member,
@@ -204,20 +221,25 @@ async def screen_member(
     found_bans = []
     if not is_whitelisted_user:
         federated_guild_ids = config.get("federated_guild_ids", [])
-        for other_guild_id in federated_guild_ids:
+        async def check_partner(other_guild_id):
             if other_guild_id == member.guild.id:
-                continue
+                return None
             other_guild = bot.get_guild(other_guild_id)
             if not other_guild:
-                continue
-            try:
-                ban_entry = await other_guild.fetch_ban(member)
-                if ban_entry:
-                    found_bans.append({"guild_name": other_guild.name, "reason": ban_entry.reason or "No reason provided."})
-            except discord.NotFound:
-                continue
-            except Exception as e:
-                logger.error(f"Error checking ban status for {member.name} in {other_guild.name}: {e}")
+                return None
+            async with bot.screening_semaphore:
+                try:
+                    entry = await asyncio.wait_for(other_guild.fetch_ban(member), timeout=10)
+                    return {"guild_name": other_guild.name, "reason": entry.reason or "No reason provided."}
+                except discord.NotFound:
+                    return None
+                except Exception as exc:
+                    logger.warning("Error checking ban status for %s in %s: %s", member.id, other_guild.name, exc)
+                    return None
+
+        found_bans = [entry for entry in await asyncio.gather(*(
+            check_partner(guild_id) for guild_id in dict.fromkeys(federated_guild_ids)
+        )) if entry]
 
     if found_bans:
         banned_in_servers = ", ".join([ban['guild_name'] for ban in found_bans])
@@ -452,6 +474,41 @@ def test_text_against_regex(text_to_check: str, regex_patterns: list[str], regex
             
     return triggered_patterns
 
+URL_CANDIDATE = re.compile(
+    r"(?i)(?<![\w@.\-])(?:https?://[^\s<>()\[\]{}\"'`]+|"
+    r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}"
+    r"(?::[0-9]+)?(?:[/?#][^\s<>()\[\]{}\"'`]*)?)"
+)
+
+
+def exclude_trusted_urls(text: str, domain_patterns: list[str]) -> str:
+    """Exempt complete trusted URL tokens, never other text or lookalike hosts."""
+    if not domain_patterns:
+        return text
+
+    def replace(match):
+        token = match.group(0)
+        url = token.rstrip(".,!?;:)]}")
+        if "\\" in url:
+            return token
+        try:
+            parsed = urlsplit(url if "://" in url else "https://" + url)
+            if parsed.username is not None or not parsed.hostname:
+                return token
+            host = parsed.hostname.lower().removeprefix("www.")
+            for pattern in domain_patterns:
+                try:
+                    if re.fullmatch(pattern, host, re.IGNORECASE):
+                        return " " + token[len(url):]
+                except re.error:
+                    logger.warning("Invalid trusted-domain regex: %s", pattern)
+        except ValueError:
+            pass
+        return token
+
+    return URL_CANDIDATE.sub(replace, text)
+
+
 def check_text_for_keywords(text_to_check: str, ruleset: dict, regex_source_label: str | None = None) -> list[str]:
     """
     Checks a given string against a specific ruleset, correctly handling
@@ -460,19 +517,8 @@ def check_text_for_keywords(text_to_check: str, ruleset: dict, regex_source_labe
     if not text_to_check or not ruleset:
         return []
     
-    # --- STEP 1: WHITELIST CHECK ---
-    # First, check for any whitelisted domains. If found, the message is safe.
-    whitelisted_patterns = ruleset.get("whitelisted_domains_regex", [])
-    if whitelisted_patterns:
-        # We can combine them into a single, fast regex for the check
-        whitelist_regex = r"(?i)\b(?:https?://)?(?:www\.)?(?:" + "|".join(whitelisted_patterns) + r")\b"
-        if re.search(whitelist_regex, text_to_check):
-            # A whitelisted domain was found. Return an empty list, indicating no flags.
-            return []
+    text_to_check = exclude_trusted_urls(text_to_check, ruleset.get("whitelisted_domains_regex", []))
 
-    # --- STEP 2: BLACKLIST/NUKING CHECK ---
-    # If we reach this point, no whitelisted domains were found.
-    # Now we can proceed with the normal keyword and link-nuking checks.
     triggered = []
     normalized_text = unidecode(text_to_check).lower()
 
@@ -707,6 +753,8 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
                 try:
                     timeout_minutes = get_timeout_minutes_for_guild(bot, member.guild)
                     await member.timeout(timedelta(minutes=timeout_minutes), reason=result.get("timeout_reason", "Flagged by scan."))
+                    if result.get("skip_alert_dispatch"):
+                        continue
                     view = ScreeningView(flagged_member_id=member.id)
                     embed = result.get("embed")
                     embed.set_footer(text=f"User ID: {member.id}")
@@ -717,16 +765,10 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
 
                     if gemini_is_available and llm_config.get("automation_mode", "off") != "off":
                         # AI-powered workflow for the scan
-                        try:
-                            profile = await bot.fetch_user(member.id)
-                        except Exception as e:
-                            logger.warning(
-                                f"Could not refresh profile context for {member.id} during full scan: {e}"
-                            )
-                            profile = member
-                        bio = getattr(profile, 'bio', "")
+                        profile = member
+                        bio = next((field.value for field in embed.fields if "Bio" in field.name), "")
                         identity_context = format_member_identity_context(member, profile)
-                        bot.loop.create_task(llm_handler.start_llm_analysis_task(
+                        llm_handler.schedule_analysis(
                             bot=bot,
                             alert_channel=results_channel,
                             embed=embed,
@@ -735,7 +777,7 @@ async def run_full_scan(bot: 'AntiScamBot', interaction: discord.Interaction):
                             content_type="Bio/Identity (Scan)",
                             content=f"{identity_context}\nBio: {bio}",
                             trigger=result.get("timeout_reason")
-                        ))
+                        )
                     else:
                         # Manual-only workflow
                         allowed_mentions = discord.AllowedMentions(users=[member])

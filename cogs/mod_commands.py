@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import data_manager
 import screening_handler
 from ui.views import ConfirmScanView, RegexTestModal, OnboardView, ConfirmGlobalBanView, AlreadyBannedView, ConfirmGlobalUnbanView, LookupPaginatorView, TestCurrentRegexModal, ConfirmMassBanView, ConfirmMassKickView, ConfirmRegexEditView
-from utils.checks import has_mod_role, is_federated_moderator
+from utils.checks import has_mod_role, federated_ban_block_reason
 from utils.command_helpers import (
     format_keyword_list, add_keyword_to_list, add_regex_to_list,
     remove_keyword_from_list, remove_regex_from_list_by_id
@@ -333,13 +333,13 @@ class ModCommands(commands.Cog):
             )
             return
 
-        # This might be heavy with 60k users, but necessary for the current OnboardView logic.
-        # Future improvement: Stream this in chunks inside the View.
-        all_bans = await data_manager.db_get_all_bans()
-        ban_count = len(all_bans)
-
+        if interaction.guild.id in self.bot.active_onboarding:
+            await interaction.followup.send("Onboarding is already running for this server.", ephemeral=True)
+            return
+        counts = await data_manager.get_onboarding_counts(interaction.guild.id)
+        ban_count = sum(counts.values()) if counts else await data_manager.db_get_ban_count()
         if ban_count == 0:
-            await interaction.followup.send("ℹ️ The federated ban list is currently empty. No onboarding action is needed.", ephemeral=True)
+            await interaction.followup.send("The federated ban list is empty; there is nothing to sync.", ephemeral=True)
             return
 
         welcome_embed = discord.Embed(
@@ -389,19 +389,21 @@ class ModCommands(commands.Cog):
         welcome_embed.add_field(
             name="🚀 Next Step: Onboarding Sync",
             value=(
-                "I will apply all historical bans from the master federated list.\nThis is a **one-time action** that will ban known scammers.\n\n"
-                "Click **Begin Onboarding** to start the sync, or **Cancel** to abort (you can onboard later with `/onboard-server`)."
+                "I will apply historical bans from the master list, skipping existing bans and recorded local unbans. Progress is saved so incomplete runs can resume.\n\n"
+                "Click **Begin / Resume Onboarding** to continue, or **Cancel** to leave it for later."
             ),
             inline=False
         )
         welcome_embed.add_field(
             name="Bans to Apply",
-            value=f"**`{ban_count}`** users will be banned.",
+            value=f"**`{ban_count}`** historical records; existing bans and local exceptions are skipped.",
             inline=False
         )
-        welcome_embed.set_footer(text="❗️ This cannot be undone.")
+        welcome_embed.set_footer(text="Progress is saved. Completed entries and local unbans are not replayed on resume.")
+        if counts:
+            welcome_embed.add_field(name="Saved Progress", value="\n".join(f"{key}: {value}" for key, value in counts.items()), inline=False)
 
-        view = OnboardView(self.bot, interaction.user, all_bans)
+        view = OnboardView(self.bot, interaction.user)
         await interaction.followup.send(embed=welcome_embed, view=view)
 
     @app_commands.command(name="mass-kick", description="Kicks multiple users from THIS SERVER by ID.")
@@ -512,8 +514,6 @@ class ModCommands(commands.Cog):
     @discord.app_commands.describe(user_id="The Discord User ID of the person to ban.", reason="The reason for the ban. This will be shown in all federated alerts.")
     async def global_ban(self, interaction: discord.Interaction, user_id: str, reason: str):
         await interaction.response.defer(ephemeral=True)
-        config = self.bot.config
-
         if not user_id.isdigit():
             await interaction.followup.send("❌ **Invalid ID:** Please provide a valid Discord User ID (numbers only).", ephemeral=True)
             return
@@ -538,26 +538,11 @@ class ModCommands(commands.Cog):
             logger.error(f"Failed to fetch user for global-ban command: {e}", exc_info=True)
             return
 
-        if user_to_ban.bot:
-            await interaction.followup.send("❌ **Action Prohibited:** You cannot target a bot account with this command.", ephemeral=True)
+        blocked = await federated_ban_block_reason(self.bot, user_to_ban, interaction.user)
+        if blocked:
+            await interaction.followup.send(f"❌ **Action Prohibited:** {blocked}", ephemeral=True)
             return
 
-        bot_owner_id = config.get("bot_owner_id")
-        if bot_owner_id and user_to_ban.id == bot_owner_id:
-            await interaction.followup.send("❌ **Action Prohibited:** You cannot target the bot owner.", ephemeral=True)
-            return
-
-        if await is_federated_moderator(self.bot, user_to_ban.id):
-            await interaction.followup.send("❌ **Action Prohibited:** You cannot target another federated moderator. This action must be performed manually by the bot owner if necessary.", ephemeral=True)
-            return
-
-        if data_manager.is_user_whitelisted(user_to_ban.id, config):
-            await interaction.followup.send(
-                "❌ **Action Prohibited:** This user is on the global whitelist and cannot be added to the federated ban list.",
-                ephemeral=True,
-            )
-            return
-    
         existing_ban = await data_manager.db_get_ban(user_id)
         if existing_ban:
             # existing_ban is a dictionary, so we can access keys like before

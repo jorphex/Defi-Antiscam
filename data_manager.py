@@ -3,6 +3,9 @@
 import os
 import json
 import logging
+import hashlib
+import asyncio
+from weakref import WeakValueDictionary
 import aiosqlite
 from typing import Optional
 
@@ -29,6 +32,19 @@ from config import (
 logger = logging.getLogger()
 DB_FILE = os.path.join(DATA_DIR, "antiscam.db")
 
+# Only active/waiting users retain a lock. No unbounded per-user cache.
+_ban_action_locks = WeakValueDictionary()
+
+
+def ban_action_lock(user_id: int | str) -> asyncio.Lock:
+    key = str(user_id)
+    lock = _ban_action_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ban_action_locks[key] = lock
+    return lock
+
+
 _yaml = YAML()
 _yaml.preserve_quotes = True
 _yaml.indent(mapping=2, sequence=4, offset=2)
@@ -37,8 +53,8 @@ _yaml.width = 120
 # --- IN-MEMORY CACHES ---
 _config_cache: Optional[dict] = None
 _keywords_cache: Optional[dict] = None
-_config_cache_mtime: Optional[float] = None
-_keywords_cache_mtime: Optional[float] = None
+_config_cache_mtime: Optional[str | float] = None
+_keywords_cache_mtime: Optional[str | float] = None
 _config_cache_source: Optional[str] = None
 _keywords_cache_source: Optional[str] = None
 
@@ -134,7 +150,7 @@ def ensure_runtime_dirs() -> None:
     os.makedirs(SERVERS_CONFIG_DIR, exist_ok=True)
 
 
-def _compute_yaml_mtime() -> Optional[float]:
+def _compute_yaml_mtime() -> Optional[str]:
     paths = []
     if os.path.exists(GLOBAL_CONFIG_FILE):
         paths.append(GLOBAL_CONFIG_FILE)
@@ -145,7 +161,9 @@ def _compute_yaml_mtime() -> Optional[float]:
     if not paths:
         return None
     try:
-        return max(os.path.getmtime(path) for path in paths)
+        # Include every file and its name, so edits/deletions cannot hide behind a newer file.
+        signatures = [(path, os.stat(path).st_mtime_ns, os.stat(path).st_size) for path in sorted(paths)]
+        return hashlib.sha256(repr(signatures).encode()).hexdigest()[:16]
     except OSError:
         return None
 
@@ -254,6 +272,24 @@ async def init_db():
                 bio_at_import TEXT
             )
         """)
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS onboarding_runs (
+                guild_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS onboarding_items (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                PRIMARY KEY (guild_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS onboarding_pending
+                ON onboarding_items (guild_id, status, user_id);
+            CREATE TABLE IF NOT EXISTS onboarding_exclusions (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            );
+        """)
         await db.commit()
 
 # --- NEW SQLITE FUNCTIONS (Replacing Load/Save Bans) ---
@@ -273,11 +309,11 @@ async def db_get_ban(user_id: int | str):
 
 async def db_add_ban(user_id, username, reason, origin_id, origin_name, mod_id, timestamp, bio=None):
     """
-    Adds or Updates a ban record in the database.
+    Adds a ban record without replacing existing evidence or provenance.
     """
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
-            INSERT OR REPLACE INTO bans 
+            INSERT OR IGNORE INTO bans
             (user_id, username, reason, origin_guild_id, origin_guild_name, moderator_id, timestamp, bio_at_import)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (str(user_id), username, reason, origin_id, origin_name, mod_id, timestamp, bio))
@@ -285,9 +321,10 @@ async def db_add_ban(user_id, username, reason, origin_id, origin_name, mod_id, 
 
 async def db_remove_ban(user_id: int | str):
     """Removes a ban record from the database."""
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM bans WHERE user_id = ?", (str(user_id),))
-        await db.commit()
+    async with ban_action_lock(user_id):
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("DELETE FROM bans WHERE user_id = ?", (str(user_id),))
+            await db.commit()
 
 async def db_get_ban_count():
     """Returns the total number of banned users."""
@@ -308,7 +345,7 @@ async def db_bulk_import_bans(ban_list: list[tuple]):
 
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.executemany("""
-            INSERT OR IGNORE INTO bans 
+            INSERT OR IGNORE INTO bans
             (user_id, username, reason, origin_guild_id, origin_guild_name, moderator_id, timestamp, bio_at_import)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, ban_list)
@@ -332,9 +369,11 @@ def is_user_whitelisted(user_id: int | str, config: Optional[dict] = None) -> bo
 
 # --- CONFIG & KEYWORDS ---
 
-def load_federation_config():
-    ensure_runtime_dirs()
+def load_federation_config(*, refresh: bool = False):
     global _config_cache, _config_cache_mtime
+    if _config_cache is not None and not refresh:
+        return _config_cache
+    ensure_runtime_dirs()
     yaml_mtime = _compute_yaml_mtime()
     if _config_cache is not None and yaml_mtime is not None and _config_cache_mtime == yaml_mtime:
         return _config_cache
@@ -499,10 +538,12 @@ async def save_fed_stats(data: dict):
         with open(FED_STATS_FILE, 'w') as f:
             json.dump(data, f, indent=4)
 
-async def load_keywords():
+async def load_keywords(*, refresh: bool = False):
     async with keywords_lock:
-        ensure_runtime_dirs()
         global _keywords_cache, _keywords_cache_mtime
+        if _keywords_cache is not None and not refresh:
+            return _keywords_cache
+        ensure_runtime_dirs()
         yaml_mtime = _compute_yaml_mtime()
         if _keywords_cache is not None and yaml_mtime is not None and _keywords_cache_mtime == yaml_mtime:
             return _keywords_cache
@@ -620,3 +661,41 @@ async def db_get_all_bans():
         async with db.execute("SELECT * FROM bans") as cursor:
             rows = await cursor.fetchall()
             return {row['user_id']: dict(row) for row in rows}
+
+
+async def record_onboarding_unban(guild_id: int, user_id: int) -> None:
+    """Protect local unbans from historical onboarding only, not future federation."""
+    async with ban_action_lock(user_id):
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("INSERT OR IGNORE INTO onboarding_exclusions VALUES (?, ?)",
+                             (str(guild_id), str(user_id)))
+            await db.commit()
+
+
+async def get_onboarding_counts(guild_id: int) -> dict[str, int]:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT status, COUNT(*) FROM onboarding_items WHERE guild_id = ? GROUP BY status",
+                              (str(guild_id),)) as cursor:
+            return dict(await cursor.fetchall())
+
+
+async def mark_onboarding_complete(guild_id: int) -> None:
+    async with sync_status_lock:
+        if os.path.exists(SYNC_STATUS_FILE):
+            with open(SYNC_STATUS_FILE, encoding="utf-8") as file:
+                status = json.load(file)
+        else:
+            status = {"synced_guild_ids": []}
+        if guild_id not in status["synced_guild_ids"]:
+            status["synced_guild_ids"].append(guild_id)
+        temporary = SYNC_STATUS_FILE + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(status, file, indent=4)
+        os.replace(temporary, SYNC_STATUS_FILE)
+
+
+async def get_onboarding_review_ids(guild_id: int) -> list[str]:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT user_id FROM onboarding_items WHERE guild_id = ? AND status = 'review' LIMIT 10",
+                              (str(guild_id),)) as cursor:
+            return [row[0] for row in await cursor.fetchall()]

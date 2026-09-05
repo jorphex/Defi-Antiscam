@@ -3,6 +3,7 @@
 import discord
 from discord.ext import commands
 import os
+import asyncio
 import config
 import data_manager
 
@@ -15,6 +16,12 @@ class AntiScamBot(commands.Bot):
         self.system_prompt = data_manager.load_system_prompt()
         self.scam_server_ids = data_manager.load_scam_servers()
         
+        self.federation_semaphore = asyncio.Semaphore(10)
+        self.screening_semaphore = asyncio.Semaphore(4)
+        self.llm_semaphore = asyncio.Semaphore(3)
+        self.llm_client = None
+        self.llm_tasks = set()
+        self.active_onboarding = set()
         self.pending_ai_actions = {}
         self.active_scans = {}
         self.bio_check_cache = {}
@@ -22,6 +29,19 @@ class AntiScamBot(commands.Bot):
         self.message_history = {}
         self.last_config_reload_at = None
         self.last_keywords_reload_at = None
+
+    async def close(self):
+        tasks = self.llm_tasks | set(self.pending_ai_actions.values()) | set(self.active_scans.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            if self.llm_client is not None:
+                await self.llm_client.aio.aclose()
+                self.llm_client = None
+        finally:
+            await super().close()
 
     async def setup_hook(self):
         """This is called once when the bot is setting up, before it logs in."""

@@ -131,8 +131,8 @@ class OwnerCommands(commands.Cog):
 
         before_state = data_manager.get_cache_state()
 
-        self.bot.config = data_manager.load_federation_config()
-        keywords_data = await data_manager.load_keywords()
+        self.bot.config = data_manager.load_federation_config(refresh=True)
+        keywords_data = await data_manager.load_keywords(refresh=True)
         self.bot.scam_server_ids = data_manager.load_scam_servers()
         self.bot.system_prompt = data_manager.load_system_prompt()
 
@@ -202,8 +202,8 @@ class OwnerCommands(commands.Cog):
             name="Config Cache",
             value=(
                 f"Source: **{state['config']['source'] or 'unknown'}**\n"
-                f"Cache mtime: `{state['config']['mtime']}`\n"
-                f"YAML mtime: `{state['config']['yaml_mtime']}`\n"
+                f"Cache revision: `{state['config']['mtime']}`\n"
+                f"YAML revision: `{state['config']['yaml_mtime']}`\n"
                 f"Legacy mtime: `{state['config']['legacy_mtime']}`\n"
                 f"Last reload: {fmt_dt(last_config)}"
             ),
@@ -213,8 +213,8 @@ class OwnerCommands(commands.Cog):
             name="Keywords Cache",
             value=(
                 f"Source: **{state['keywords']['source'] or 'unknown'}**\n"
-                f"Cache mtime: `{state['keywords']['mtime']}`\n"
-                f"YAML mtime: `{state['keywords']['yaml_mtime']}`\n"
+                f"Cache revision: `{state['keywords']['mtime']}`\n"
+                f"YAML revision: `{state['keywords']['yaml_mtime']}`\n"
                 f"Legacy mtime: `{state['keywords']['legacy_mtime']}`\n"
                 f"Last reload: {fmt_dt(last_keywords)}"
             ),

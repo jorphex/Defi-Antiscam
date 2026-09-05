@@ -55,3 +55,20 @@ The bot needs these permissions in any member server to function correctly:
 - GridPlus
 - DataDash
 - Brilla Finance
+
+
+## Historical onboarding and development checks
+
+`/onboard-server` saves progress and can resume incomplete runs. Completed entries,
+recorded local unbans, and retained unban audit entries are skipped. Interrupted
+ban attempts with an uncertain outcome are reported for review rather than blindly
+reapplied. Previously completed servers remain protected from a full replay.
+
+Run offline regressions after installing `requirements.txt`:
+
+```bash
+python -B -m unittest discover -s tests -v
+ruff check antiscam.py config.py data_manager.py llm_handler.py screening_handler.py cogs ui utils tests
+```
+
+Tests mock Discord/Gemini and use temporary databases; no bot login is needed.

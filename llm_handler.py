@@ -25,20 +25,30 @@ class AnalysisResult(BaseModel):
     reason: str
 
 # --- Gemini Client ---
-def initialize_gemini():
+LLM_TIMEOUT_SECONDS = 30
+
+def initialize_gemini(bot):
     """Initializes the Gemini client using the API key from environment variables."""
+    if bot.llm_client is not None:
+        return True
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         logger.warning("GEMINI_API_KEY not found in environment variables. LLM features will be disabled.")
         return False
-    return True
+    try:
+        bot.llm_client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=25000))
+        return True
+    except Exception:
+        logger.exception("Could not initialize Gemini; manual review remains available")
+        return False
 
 async def get_llm_verdict(bot: 'AntiScamBot', member: discord.Member, content_type: str, content: str, trigger: str) -> Optional[AnalysisResult]:
     """
     Analyzes content using the Gemini API and returns a structured verdict.
     """
     try:
-        client = genai.Client()
+        if bot.llm_client is None:
+            return None
         
         user_prompt = (
             "--- START DATA PACKET ---\n"
@@ -53,16 +63,21 @@ async def get_llm_verdict(bot: 'AntiScamBot', member: discord.Member, content_ty
             "--- END DATA PACKET ---"
         )
 
-        response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=bot.system_prompt,
-                response_mime_type="application/json",
-                response_schema=AnalysisResult,
-                temperature=0.0
-            )
-        )
+        async def request():
+            async with bot.llm_semaphore:
+                return await bot.llm_client.aio.models.generate_content(
+                    model="gemini-3.5-flash-lite",
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=bot.system_prompt,
+                        response_mime_type="application/json",
+                        response_schema=AnalysisResult,
+                        temperature=0.0
+                    )
+                )
+
+        # Includes queue time: overloaded requests fall back to the already-visible manual alert.
+        response = await asyncio.wait_for(request(), timeout=LLM_TIMEOUT_SECONDS)
 
         if response.parsed:
             logger.info(f"Gemini analysis for {member.name} completed. Verdict: {response.parsed.verdict}")
@@ -112,7 +127,7 @@ async def perform_automated_action(bot: 'AntiScamBot', alert_message: discord.Me
             detailed_reason_field = {"name": "AI Analysis Result", "value": f"```{public_reason}```"}
             logger.info(f"AI verdict is MALICIOUS. Calling the global ban handler for {member.name}.")
             
-            await process_federated_ban(
+            result = await process_federated_ban(
                 bot=bot,
                 origin_guild=guild,
                 user_to_ban=member,
@@ -127,11 +142,11 @@ async def perform_automated_action(bot: 'AntiScamBot', alert_message: discord.Me
             embed.color = discord.Color.dark_red()
             for i, field in enumerate(embed.fields):
                 if field.name == "Status":
-                    embed.set_field_at(i, name="Status", value="🔴 Auto banned, malicious intent", inline=True)
+                    embed.set_field_at(i, name="Status", value=result.summary(), inline=True)
                     break
             
             view = ScreeningView(flagged_member_id=flagged_member_id)
-            view.update_buttons_for_state('banned')
+            view.update_buttons_for_state('banned' if result.banned_in(guild.id) else 'initial')
             await alert_message.edit(embed=embed, view=view)
 
         except Exception as e:
@@ -165,41 +180,49 @@ async def delayed_action_wrapper(delay: int, bot: 'AntiScamBot', alert_message: 
     except asyncio.CancelledError:
         logger.info(f"Delayed action for {flagged_member_id} was cancelled by a moderator.")
     finally:
-        if alert_message.id in bot.pending_ai_actions:
+        if bot.pending_ai_actions.get(alert_message.id) is asyncio.current_task():
             del bot.pending_ai_actions[alert_message.id]
             
-async def start_llm_analysis_task(bot: 'AntiScamBot', alert_channel: discord.TextChannel, embed: discord.Embed, view: discord.ui.View, flagged_member: discord.Member, content_type: str, content: str, trigger: str):
-    """
-    Orchestrates an AI-powered alert with a fallback to manual mode on API failure.
-    """
-    verdict_result = await get_llm_verdict(bot, flagged_member, content_type, content, trigger)
+def schedule_analysis(**kwargs):
+    """Track tasks even while their first alert is being posted, for clean shutdown."""
+    bot = kwargs["bot"]
+    task = asyncio.create_task(start_llm_analysis_task(**kwargs))
+    bot.llm_tasks.add(task)
+    task.add_done_callback(bot.llm_tasks.discard)
+    return task
 
-    if verdict_result is None:
-        logger.warning(f"Gemini analysis failed for {flagged_member.name}. Falling back to manual alert.")
-        allowed_mentions = discord.AllowedMentions(users=[flagged_member])
-        await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
-        return
 
-    verdict_colors = {Verdict.MALICIOUS: "🔴", Verdict.SUSPICIOUS: "🟡", Verdict.SAFE: "🟢"}
-    verdict_name = f"🤖 {verdict_colors[verdict_result.verdict]} **{verdict_result.verdict.value}**"    
-    verdict_text = f"*{verdict_result.reason}*"
-    embed.add_field(name=verdict_name, value=verdict_text, inline=False)
-    
-    allowed_mentions = discord.AllowedMentions(users=[flagged_member])
-    alert_message = await alert_channel.send(embed=embed, view=view, allowed_mentions=allowed_mentions)
+async def start_llm_analysis_task(bot: 'AntiScamBot', alert_channel: discord.TextChannel,
+        embed: discord.Embed, view: discord.ui.View, flagged_member: discord.Member,
+        content_type: str, content: str, trigger: str):
+    """Post first; analyze/update the same alert while allowing moderator cancellation."""
+    alert_message = None
+    try:
+        alert_message = await alert_channel.send(embed=embed, view=view,
+            allowed_mentions=discord.AllowedMentions(users=[flagged_member]))
+        bot.pending_ai_actions[alert_message.id] = asyncio.current_task()
+        verdict = await get_llm_verdict(bot, flagged_member, content_type, content, trigger)
+        if verdict is None:
+            return
 
-    guild_id_str = str(alert_channel.guild.id)
-    llm_defaults = bot.config.get("llm_settings", {}).get("defaults", {})
-    llm_config = bot.config.get("llm_settings", {}).get("per_guild_settings", {}).get(guild_id_str, llm_defaults)
-    
-    if llm_config.get("automation_mode") == "full" and verdict_result.verdict in [Verdict.MALICIOUS, Verdict.SAFE]:
-        delay = llm_config.get("automation_delay_seconds", 180)
-        logger.info(f"Scheduling automated action ({verdict_result.verdict.value}) for {flagged_member.name} in {delay} seconds.")
-        
-        task = bot.loop.create_task(
-            delayed_action_wrapper(
-                delay, bot, alert_message, flagged_member.id, verdict_result, llm_config
-            )
-        )
-        
-        bot.pending_ai_actions[alert_message.id] = task
+        # The moderator may have deleted the alert while inference was running.
+        await alert_channel.fetch_message(alert_message.id)
+        colors = {Verdict.MALICIOUS: "🔴", Verdict.SUSPICIOUS: "🟡", Verdict.SAFE: "🟢"}
+        embed.add_field(name=f"🤖 {colors[verdict.verdict]} **{verdict.verdict.value}**",
+                        value=verdict.reason[:1024], inline=False)
+        alert_message = await alert_message.edit(embed=embed, view=view)
+        defaults = bot.config.get("llm_settings", {}).get("defaults", {})
+        settings = bot.config.get("llm_settings", {}).get("per_guild_settings", {}).get(str(alert_channel.guild.id), defaults)
+        if settings.get("automation_mode") == "full" and verdict.verdict in (Verdict.MALICIOUS, Verdict.SAFE):
+            await delayed_action_wrapper(settings.get("automation_delay_seconds", 180),
+                bot, alert_message, flagged_member.id, verdict, settings)
+    except asyncio.CancelledError:
+        logger.info("AI analysis/action cancelled for user %s", flagged_member.id)
+        raise
+    except discord.NotFound:
+        logger.info("AI alert was removed for user %s", flagged_member.id)
+    except Exception:
+        logger.exception("AI alert processing failed for user %s", flagged_member.id)
+    finally:
+        if alert_message and bot.pending_ai_actions.get(alert_message.id) is asyncio.current_task():
+            del bot.pending_ai_actions[alert_message.id]

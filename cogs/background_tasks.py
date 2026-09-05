@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from config import logger
 import data_manager
+import screening_handler
 
 if TYPE_CHECKING:
     from antiscam import AntiScamBot
@@ -202,11 +203,12 @@ class BackgroundTasks(commands.Cog):
     async def refresh_config_cache(self):
         """Periodically refresh config/keywords to pick up file edits without hot-path I/O."""
         try:
+            screening_handler.prune_screening_caches(self.bot)
             before_state = data_manager.get_cache_state()
-            new_config = data_manager.load_federation_config()
+            new_config = data_manager.load_federation_config(refresh=True)
             if new_config:
                 self.bot.config = new_config
-            keywords_data = await data_manager.load_keywords()
+            keywords_data = await data_manager.load_keywords(refresh=True)
             if keywords_data:
                 self.bot.suspicious_identity_tags = keywords_data.get("global_keywords", {}).get("suspicious_identity_tags", [])
             self.bot.scam_server_ids = data_manager.load_scam_servers()

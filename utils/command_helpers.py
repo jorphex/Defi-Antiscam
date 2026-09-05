@@ -17,7 +17,7 @@ async def add_global_keyword_to_list(interaction: discord.Interaction, keyword: 
         await interaction.followup.send("❌ Keyword cannot be empty.")
         return
 
-    keywords_data = await data_manager.load_keywords()
+    keywords_data = await data_manager.load_keywords(refresh=True)
     if keywords_data is None:
         await interaction.followup.send("❌ Could not load the keywords file. Please check the bot's logs.")
         return
@@ -47,7 +47,7 @@ async def remove_global_keyword_from_list(interaction: discord.Interaction, keyw
         await interaction.followup.send("❌ Keyword cannot be empty.")
         return
 
-    keywords_data = await data_manager.load_keywords()
+    keywords_data = await data_manager.load_keywords(refresh=True)
     global_keywords = keywords_data.get("global_keywords", {})
     
     target_list = None
@@ -100,7 +100,7 @@ async def add_keyword_to_list(interaction: discord.Interaction, keyword: str, pr
         await interaction.followup.send("❌ Keyword cannot be empty.")
         return
 
-    keywords_data = await data_manager.load_keywords()
+    keywords_data = await data_manager.load_keywords(refresh=True)
     guild_id_str = str(interaction.guild.id)
 
     server_keywords_parent = keywords_data.setdefault("per_server_keywords", {})
@@ -134,7 +134,7 @@ async def add_regex_to_list(interaction: discord.Interaction, pattern: str, is_g
         await interaction.followup.send(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`\nPlease test your pattern with `/test-regex` first.")
         return
 
-    keywords_data = await data_manager.load_keywords()
+    keywords_data = await data_manager.load_keywords(refresh=True)
     target_list = None
     list_name = ""
 
@@ -166,7 +166,7 @@ async def remove_keyword_from_list(interaction: discord.Interaction, keyword: st
         await interaction.followup.send("❌ Keyword cannot be empty.")
         return
 
-    keywords_data = await data_manager.load_keywords()
+    keywords_data = await data_manager.load_keywords(refresh=True)
     guild_id_str = str(interaction.guild.id)
     
     server_keywords = keywords_data.get("per_server_keywords", {}).get(guild_id_str, {})
@@ -190,7 +190,7 @@ async def remove_regex_from_list_by_id(interaction: discord.Interaction, index: 
         await interaction.followup.send("❌ Index must be a positive number. Use `/list-keywords` to find the correct ID.")
         return
 
-    keywords_data = await data_manager.load_keywords()
+    keywords_data = await data_manager.load_keywords(refresh=True)
     target_list = None
     list_name = ""
     
@@ -224,7 +224,7 @@ async def edit_regex_by_id(interaction: discord.Interaction, index: int, new_pat
         await interaction.followup.send(f"❌ **Invalid Regex:** That pattern is not valid.\n`{e}`\nPlease test your pattern with `/test-regex` first.")
         return
 
-    keywords_data = await data_manager.load_keywords()
+    keywords_data = await data_manager.load_keywords(refresh=True)
     target_list = None
     list_name = ""
 

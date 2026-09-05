@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from config import logger
 import data_manager
 from utils.federation_handler import process_federated_ban, process_federated_unban
-from utils.command_helpers import update_onboard_command_visibility, edit_regex_by_id
+from utils.command_helpers import edit_regex_by_id
+from utils.checks import check_moderator
 from utils.helpers import get_delete_days_for_guild, truncate_audit_reason
 from screening_handler import test_text_against_regex
 
@@ -110,7 +111,25 @@ class TestCurrentRegexModal(discord.ui.Modal, title="Test Against Current Regex"
             await interaction.followup.send("An unexpected error occurred. Please check the logs.", ephemeral=True)
 
 # --- VIEWS ---
-class ScreeningView(discord.ui.View):
+class ModerationAlertView(discord.ui.View):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await check_moderator(interaction)
+
+    @staticmethod
+    async def target_id(interaction: discord.Interaction) -> Optional[int]:
+        # Never cache a target on the shared view registered after reconnect/restart.
+        try:
+            footer = interaction.message.embeds[0].footer.text
+            match = re.fullmatch(r"User ID: (\d+)", footer or "")
+            if match:
+                return int(match.group(1))
+        except (IndexError, AttributeError, TypeError, ValueError):
+            pass
+        await interaction.followup.send("❌ Could not find a valid user ID in this alert.", ephemeral=True)
+        return None
+
+
+class ScreeningView(ModerationAlertView):
     def __init__(self, flagged_member_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.flagged_member_id = flagged_member_id
@@ -154,39 +173,32 @@ class ScreeningView(discord.ui.View):
         The User object is almost always available, while the Member is only if they are in the server.
         """
         bot: 'AntiScamBot' = interaction.client
-        if not self.flagged_member_id:
-            try:
-                embed_footer = interaction.message.embeds[0].footer.text
-                match = re.search(r'User ID: (\d+)', embed_footer)
-                if match:
-                    self.flagged_member_id = int(match.group(1))
-                else:
-                    await interaction.followup.send("❌ Could not find user ID in the alert footer.", ephemeral=True)
-                    return None, None
-            except (IndexError, TypeError, ValueError, AttributeError):
-                await interaction.followup.send("❌ Could not parse user ID from the alert.", ephemeral=True)
-                return None, None
+        target_id = await self.target_id(interaction)
+        if target_id is None:
+            return None, None
 
-        user = bot.get_user(self.flagged_member_id)
+        user = bot.get_user(target_id)
         if not user:
             try:
-                user = await bot.fetch_user(self.flagged_member_id)
+                user = await bot.fetch_user(target_id)
             except discord.NotFound:
                 await interaction.followup.send("❌ User ID is invalid or the user account was deleted.", ephemeral=True)
                 return None, None
         
-        member = interaction.guild.get_member(self.flagged_member_id)
+        member = interaction.guild.get_member(target_id)
         
         return user, member
                 
-    async def update_embed(self, interaction: discord.Interaction, status: str, color: discord.Color):
+    async def update_embed(self, interaction: discord.Interaction, status: str, color: discord.Color, state: str = "initial"):
+        view = ScreeningView()
+        view.update_buttons_for_state(state)
         embed = interaction.message.embeds[0]
         embed.color = color
         for i, field in enumerate(embed.fields):
             if field.name == "Status":
                 embed.set_field_at(i, name="Status", value=status, inline=True)
                 break
-        await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=self)
+        await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=view)
 
     @discord.ui.button(label="Ban", style=discord.ButtonStyle.red, custom_id="screening_ban")
     async def ban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -202,7 +214,11 @@ class ScreeningView(discord.ui.View):
             original_embed = interaction.message.embeds[0]
             descriptive_reason = "Reason not parsed from alert." # Fallback
 
-            if "User Banned Elsewhere" in original_embed.title:
+            original_reason = next((field.value.strip('`') for field in original_embed.fields
+                                    if field.name == "Original Ban Reason"), None)
+            if original_reason:
+                descriptive_reason = original_reason
+            elif "User Banned Elsewhere" in original_embed.title:
                 for field in original_embed.fields:
                     if "Banned In" in field.name:
                         descriptive_reason = f"User already banned in {field.name.split(': ')[1]}."
@@ -222,18 +238,13 @@ class ScreeningView(discord.ui.View):
                 f"[Federated Action] {descriptive_reason} | AlertID:{interaction.message.id}"
             )
             
-            delete_days = get_delete_days_for_guild(bot, interaction.guild)
-            delete_seconds = delete_days * 86400
-            
-            await interaction.guild.ban(user, reason=reason_text, delete_message_seconds=delete_seconds)
-            
-            self.update_buttons_for_state('banned')
-            
-            status_text = "✅ Banned"
-            if not member:
-                status_text += " (User had left)"
-                
-            await self.update_embed(interaction, status_text, discord.Color.red())
+            result = await process_federated_ban(
+                bot, interaction.guild, user, interaction.user, reason_text,
+                {"name": "Ban Reason", "value": descriptive_reason}, is_proactive_command=True,
+            )
+            state = "banned" if result.banned_in(interaction.guild.id) else "initial"
+            await self.update_embed(interaction, result.summary(),
+                discord.Color.red() if result.complete else discord.Color.orange(), state)
         except Exception as e:
             logger.error(f"Failed to ban user {self.flagged_member_id}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ Error banning: {e}", ephemeral=True)
@@ -249,16 +260,13 @@ class ScreeningView(discord.ui.View):
         
         if not member:
             await self.update_embed(interaction, "❌ Kick Failed (User left)", discord.Color.greyple())
-            self.kick_button.disabled = True
-            await interaction.followup.edit_message(message_id=interaction.message.id, view=self)
             await interaction.followup.send("❌ Cannot kick a user who is not in the server.", ephemeral=True)
             return
 
         try:
             reason_text = "Kicked by Moderator via screening alert."
             await member.kick(reason=reason_text)
-            self.update_buttons_for_state('kicked')
-            await self.update_embed(interaction, "👢 Kicked", discord.Color.blue())
+            await self.update_embed(interaction, "👢 Kicked", discord.Color.blue(), 'kicked')
         except Exception as e:
             logger.error(f"Failed to kick member {self.flagged_member_id}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ An error occurred while kicking: {e}", ephemeral=True)
@@ -279,7 +287,6 @@ class ScreeningView(discord.ui.View):
         try:
             reason_text = "[Federated Action] Unbanned by Moderator via screening alert."
             await interaction.guild.unban(user_to_unban, reason=reason_text)
-            self.update_buttons_for_state('initial')
             
             # We need to pass the interaction to update_embed
             await self.update_embed(interaction, "🟡 Unbanned", discord.Color.gold())
@@ -311,42 +318,33 @@ class ScreeningView(discord.ui.View):
             await interaction.followup.send("✅ Alert dismissed.", ephemeral=True)
         except Exception as e:
             logger.error(f"Failed to delete screening message: {e}", exc_info=True)
-            if not interaction.is_done():
+            if not interaction.response.is_done():
                  await interaction.followup.send("❌ An error occurred during cleanup.", ephemeral=True)
 
-class FederatedAlertView(discord.ui.View):
+class FederatedAlertView(ModerationAlertView):
     def __init__(self, banned_user_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.banned_user_id = banned_user_id
 
     @discord.ui.button(label="Unban Locally", style=discord.ButtonStyle.secondary, custom_id="fed_alert_unban")
     async def unban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.banned_user_id:
-            try:
-                embed_footer = interaction.message.embeds[0].footer.text
-                match = re.search(r'User ID: (\d+)', embed_footer)
-                if match:
-                    self.banned_user_id = int(match.group(1))
-                    logger.info(f"Recovered user ID {self.banned_user_id} from footer for persistent view.")
-                else:
-                    await interaction.response.send_message("❌ Could not find a valid user ID in the alert footer.", ephemeral=True)
-                    return
-            except (IndexError, AttributeError, TypeError):
-                await interaction.response.send_message("❌ Could not parse user ID from the alert footer.", ephemeral=True)
-                return
-            
         await interaction.response.defer()
-        user_to_unban = discord.Object(id=self.banned_user_id)
+        target_id = await self.target_id(interaction)
+        if target_id is None:
+            return
+        user_to_unban = discord.Object(id=target_id)
+        await data_manager.record_onboarding_unban(interaction.guild.id, target_id)
         try:
             await interaction.guild.fetch_ban(user_to_unban)
         except discord.NotFound:
-            button.disabled = True
+            view = FederatedAlertView(target_id)
+            view.unban_button.disabled = True
             await interaction.followup.send("This user is not currently banned in this server.", ephemeral=True)
             try:
                 embed = interaction.message.embeds[0]
                 if "UPDATE:" not in embed.description:
                     embed.description += f"\n\n**UPDATE:** Action attempted by {interaction.user.mention}, but user was already unbanned."
-                await interaction.edit_original_response(embed=embed, view=self)
+                await interaction.edit_original_response(embed=embed, view=view)
             except Exception:
                 pass
             return
@@ -358,16 +356,17 @@ class FederatedAlertView(discord.ui.View):
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.green()
             embed.description += f"\n\n**UPDATE:** User was unbanned from this server by {interaction.user.mention}."
-            button.disabled = True
+            view = FederatedAlertView(target_id)
+            view.unban_button.disabled = True
             
-            await interaction.edit_original_response(embed=embed, view=self)
+            await interaction.edit_original_response(embed=embed, view=view)
             
-            logger.info(f"Federated ban for {self.banned_user_id} was reversed in {interaction.guild.name} by {interaction.user.name}.")
+            logger.info(f"Federated ban for {target_id} was reversed in {interaction.guild.name} by {interaction.user.name}.")
         except Exception as e:
-            logger.error(f"Failed to reverse federated ban for {self.banned_user_id}: {e}", exc_info=True)
+            logger.error(f"Failed to reverse federated ban for {target_id}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ An unexpected error occurred while unbanning: {e}", ephemeral=True)
 
-class FederatedUnbanAlertView(discord.ui.View):
+class FederatedUnbanAlertView(ModerationAlertView):
     def __init__(self, unbanned_user_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.unbanned_user_id = unbanned_user_id
@@ -377,21 +376,10 @@ class FederatedUnbanAlertView(discord.ui.View):
         await interaction.response.defer()
         bot: 'AntiScamBot' = interaction.client
 
-        if not self.unbanned_user_id:
-            # Fallback to get ID from footer if needed
-            try:
-                embed_footer = interaction.message.embeds[0].footer.text
-                match = re.search(r'User ID: (\d+)', embed_footer)
-                if match:
-                    self.unbanned_user_id = int(match.group(1))
-                else:
-                    await interaction.followup.send("❌ Could not find user ID in the alert footer.", ephemeral=True)
-                    return
-            except (IndexError, AttributeError):
-                await interaction.followup.send("❌ Could not parse user ID from the alert.", ephemeral=True)
-                return
-
-        user_to_reban = discord.Object(id=self.unbanned_user_id)
+        target_id = await self.target_id(interaction)
+        if target_id is None:
+            return
+        user_to_reban = discord.Object(id=target_id)
         try:
             reason_text = "[Local Action] Federated unban reversed by local Moderator."
             delete_days = get_delete_days_for_guild(bot, interaction.guild)
@@ -400,11 +388,12 @@ class FederatedUnbanAlertView(discord.ui.View):
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.orange()
             embed.description += f"\n\n**UPDATE:** User was re-banned in this server by {interaction.user.mention}."
-            button.disabled = True
-            await interaction.message.edit(embed=embed, view=self)
-            logger.info(f"Federated unban for {self.unbanned_user_id} was reversed in {interaction.guild.name} by {interaction.user.name}.")
+            view = FederatedUnbanAlertView(target_id)
+            view.reban_button.disabled = True
+            await interaction.message.edit(embed=embed, view=view)
+            logger.info(f"Federated unban for {target_id} was reversed in {interaction.guild.name} by {interaction.user.name}.")
         except Exception as e:
-            logger.error(f"Failed to reverse federated unban for {self.unbanned_user_id}: {e}", exc_info=True)
+            logger.error(f"Failed to reverse federated unban for {target_id}: {e}", exc_info=True)
             await interaction.followup.send(f"❌ Error re-banning: {e}", ephemeral=True)
 
 class ConfirmGlobalBanView(discord.ui.View):
@@ -428,23 +417,9 @@ class ConfirmGlobalBanView(discord.ui.View):
         await interaction.response.edit_message(content="✅ **Confirmation received. Propagating global ban...**", embed=None, view=self)
 
         try:
-            config = self.bot.config
-            origin_mod_channel_id = config.get("federation_notice_channels", {}).get(str(interaction.guild.id))
-            if origin_mod_channel_id:
-                origin_mod_channel = self.bot.get_channel(origin_mod_channel_id) or await self.bot.fetch_channel(origin_mod_channel_id)
-                if origin_mod_channel:
-                    confirm_embed = discord.Embed(
-                        title="✅ Proactive Global Ban Initiated",
-                        description="Ban was initiated from this server and has been broadcast to all federated servers.",
-                        color=discord.Color.blue(),
-                        timestamp=datetime.now(timezone.utc)
-                    )
-                    confirm_embed.set_author(name=f"{self.user_to_ban.name} (`{self.user_to_ban.id}`)", icon_url=self.user_to_ban.display_avatar.url)
-                    confirm_embed.add_field(name="Reason", value=f"```{self.reason}```", inline=False)
-                    await origin_mod_channel.send(embed=confirm_embed)
             detailed_reason_field = {"name": "Ban Reason", "value": f"```{self.reason}```"}
 
-            await process_federated_ban(
+            result = await process_federated_ban(
                 self.bot,
                 origin_guild=interaction.guild,
                 user_to_ban=self.user_to_ban,
@@ -454,7 +429,7 @@ class ConfirmGlobalBanView(discord.ui.View):
                 is_proactive_command=True
             )
             
-            await interaction.followup.send(f"✅ **Success!** The global ban for **{self.user_to_ban.name}** has been initiated and propagated.", ephemeral=True)
+            await interaction.followup.send(f"**Global ban for {self.user_to_ban.name}:**\n{result.summary()}", ephemeral=True)
             logger.info(f"Moderator {interaction.user.name} initiated a proactive global ban for {self.user_to_ban.name} from {interaction.guild.name}.")
 
         except Exception as e:
@@ -623,94 +598,78 @@ class ConfirmRegexEditView(discord.ui.View):
         await interaction.response.edit_message(content="Regex edit cancelled.", view=self)
 
 class OnboardView(discord.ui.View):
-    def __init__(self, bot: 'AntiScamBot', author: discord.User, fed_bans: dict):
+    def __init__(self, bot: 'AntiScamBot', author: discord.User):
         super().__init__(timeout=300.0)
         self.bot = bot
         self.author = author
-        self.fed_bans = fed_bans
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author.id:
-            await interaction.response.send_message("You are not the one who initiated this command.", ephemeral=True)
+            await interaction.response.send_message("You did not initiate this onboarding.", ephemeral=True)
             return False
-        return True
+        return await check_moderator(interaction)
 
-    @discord.ui.button(label="Begin Onboarding", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Begin / Resume Onboarding", style=discord.ButtonStyle.danger)
     async def begin_onboarding(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from utils.onboarding import run_onboarding, UNRESOLVED
+
         await interaction.response.defer()
+        guild = interaction.guild
+        if guild.id in self.bot.active_onboarding:
+            await interaction.followup.send("Onboarding is already running for this server.", ephemeral=True)
+            return
+        self.bot.active_onboarding.add(guild.id)
+        progress = None
+        try:
+            status = await data_manager.load_sync_status()
+            if guild.id in status["synced_guild_ids"]:
+                await interaction.followup.send("This server has already completed onboarding.", ephemeral=True)
+                return
+            for item in self.children:
+                item.disabled = True
+            await interaction.message.edit(view=self)
+            # A regular message can be updated after the interaction token expires.
+            progress = await interaction.channel.send("⏳ Preparing historical ban sync...")
 
-        for item in self.children:
-            item.disabled = True
-        await interaction.message.edit(view=self)
-
-        progress_embed = discord.Embed(
-            title="⏳ Onboarding in Progress...",
-            description="Applying historical bans. This may take some time.",
-            color=discord.Color.orange()
-        )
-        progress_embed.add_field(name="Checked", value="`0`", inline=True)
-        progress_embed.add_field(name="Applied", value="`0`", inline=True)
-        progress_embed.add_field(name="Failed", value="`0`", inline=True)
-        
-        progress_message = await interaction.followup.send(embed=progress_embed, wait=True)
-
-        target_guild = interaction.guild
-        total_bans = len(self.fed_bans)
-        applied_count = 0
-        already_banned_count = 0
-        failed_count = 0
-        update_interval = 25
-
-        for i, (user_id_str, ban_data) in enumerate(self.fed_bans.items()):
-            user_id = int(user_id_str)
-            user_obj = discord.Object(id=user_id)
-
-            try:
-                await target_guild.fetch_ban(user_obj)
-                already_banned_count += 1
-                continue
-            except discord.NotFound:
+            async def report(counts, final=False):
+                unresolved = sum(counts.get(key, 0) for key in UNRESOLVED)
+                title = "Onboarding Complete" if final and not unresolved else "Onboarding Progress"
+                lines = [f"**{key.replace('_', ' ').title()}:** {value}" for key, value in sorted(counts.items())]
+                if final and unresolved:
+                    title = "Onboarding Incomplete"
+                    lines.append("Run `/onboard-server` again to resume pending work and retry failures.")
+                    if counts.get("review"):
+                        ids = await data_manager.get_onboarding_review_ids(guild.id)
+                        lines.append("Interrupted actions need review; these users were left unchanged: " + ", ".join(ids))
+                        lines.append("Resolve using the existing ban/unban tools, then resume onboarding.")
+                embed = discord.Embed(title=title, description="\n".join(lines) or "No historical bans to apply.",
+                    color=discord.Color.green() if final and not unresolved else discord.Color.orange())
                 try:
-                    reason = f"Federated ban sync. Original reason: {ban_data.get('reason', 'N/A')}"
-                    delete_days = get_delete_days_for_guild(self.bot, target_guild)
-                    delete_seconds = delete_days * 86400
-                    await target_guild.ban(user_obj, reason=reason[:512], delete_message_seconds=delete_seconds)
-                    applied_count += 1
-                except Exception as e:
-                    logger.warning(f"Failed to onboard-ban user {user_id} in {target_guild.name}: {e}")
-                    failed_count += 1
-            
-            if (i + 1) % update_interval == 0 or (i + 1) == total_bans:
-                progress_embed.set_field_at(0, name="Checked", value=f"`{i+1} / {total_bans}`", inline=True)
-                progress_embed.set_field_at(1, name="Applied", value=f"`{applied_count}`", inline=True)
-                progress_embed.set_field_at(2, name="Failed", value=f"`{failed_count}`", inline=True)
-                await progress_message.edit(embed=progress_embed)
+                    await progress.edit(content=None, embed=embed)
+                except discord.HTTPException:
+                    logger.exception("Could not update onboarding progress for %s", guild.id)
 
-        completion_embed = discord.Embed(
-            title="✅ Onboarding Complete",
-            description="The server is now up to date with the federated ban list.",
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        completion_embed.add_field(name="Bans Applied", value=f"`{applied_count}`", inline=True)
-        completion_embed.add_field(name="Already Banned", value=f"`{already_banned_count}`", inline=True)
-        completion_embed.add_field(name="Failed", value=f"`{failed_count}`", inline=True)
-        
-        await progress_message.edit(content=None, embed=completion_embed)
-
-        sync_status = await data_manager.load_sync_status()
-        if target_guild.id not in sync_status["synced_guild_ids"]:
-            sync_status["synced_guild_ids"].append(target_guild.id)
-            await data_manager.save_sync_status(sync_status)
-        
-        await update_onboard_command_visibility(self.bot, interaction.guild)
-        logger.info(f"Server {interaction.guild.name} has been successfully onboarded and permissions updated.")
+            counts = await run_onboarding(self.bot, guild, report)
+            await report(counts, final=True)
+        except Exception:
+            logger.exception("Onboarding paused for %s", guild.id)
+            message = "❌ Onboarding paused. Progress is saved. Check permissions (including View Audit Log), then run `/onboard-server` to resume."
+            if progress:
+                try:
+                    await progress.edit(content=message, embed=None)
+                except discord.HTTPException:
+                    logger.exception("Could not post onboarding failure for %s", guild.id)
+            else:
+                await interaction.followup.send(message, ephemeral=True)
+        finally:
+            self.bot.active_onboarding.discard(guild.id)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(content="Onboarding cancelled.", view=self, embed=None)
+
 
 class LookupPaginatorView(discord.ui.View):
     def __init__(self, author: discord.User, query: str, results: list):
@@ -895,7 +854,7 @@ class ConfirmMassBanView(discord.ui.View):
                     real_user = await self.bot.fetch_user(uid)
                     user_to_ban = real_user
                 except discord.NotFound:
-                    pass
+                    user_to_ban.name = f"ID: {uid}"
 
                 # Check 1: Is user on the Master List?
                 existing_ban = await data_manager.db_get_ban(uid)
@@ -949,7 +908,7 @@ class ConfirmMassBanView(discord.ui.View):
                         continue
 
                 # If we get here, the user is NOT on the master list. Proceed with full Global Ban.
-                await process_federated_ban(
+                result = await process_federated_ban(
                     bot=self.bot,
                     origin_guild=interaction.guild,
                     user_to_ban=user_to_ban,
@@ -958,7 +917,11 @@ class ConfirmMassBanView(discord.ui.View):
                     detailed_reason_field=detailed_reason_field,
                     is_proactive_command=True 
                 )
-                success_count += 1
+                if result.complete:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    failed_ids.append(f"{uid}: {result.summary()}")
                 
                 if (success_count + local_catchup_count) % 10 == 0:
                     await asyncio.sleep(1)
@@ -974,7 +937,7 @@ class ConfirmMassBanView(discord.ui.View):
             color=discord.Color.dark_red(),
             timestamp=datetime.now(timezone.utc)
         )
-        report_embed.add_field(name="Global Bans Initiated", value=f"**{success_count}**", inline=True)
+        report_embed.add_field(name="Global Bans Completed", value=f"**{success_count}**", inline=True)
         
         if local_catchup_count > 0:
             report_embed.add_field(name="Local Catch-up Bans", value=f"**{local_catchup_count}**", inline=True)
