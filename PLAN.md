@@ -30,5 +30,7 @@ Review corrections verified: protected targets are checked at command entry and 
 
 Deployment authorized by user: commit and push the verified changes, restart the existing bind-mounted container without changing dependencies or mounts, and verify startup plus checkpoint schema.
 
-- [ ] Commit and push changes to main.
-- [ ] Back up the database, redeploy, and verify runtime health.
+- [x] Commit and push changes to main (`cf8cfe2`).
+- [x] Back up the database, redeploy, and verify runtime health.
+
+Deployment result (2026-09-05): source commit `cf8cfe2` pushed to main; existing bind-mounted container restarted. All four cogs loaded, 40 commands synced, Discord connected to 9 guilds, Gemini initialized, checkpoint schema verified, and initial external sync finished successfully with no new users. Container running with zero automatic restarts/OOM and no startup errors. Database backup retained in private runtime storage.
