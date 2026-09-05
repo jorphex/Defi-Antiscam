@@ -34,3 +34,9 @@ Deployment authorized by user: commit and push the verified changes, restart the
 - [x] Back up the database, redeploy, and verify runtime health.
 
 Deployment result (2026-09-05): source commit `cf8cfe2` pushed to main; existing bind-mounted container restarted. All four cogs loaded, 40 commands synced, Discord connected to 9 guilds, Gemini initialized, checkpoint schema verified, and initial external sync finished successfully with no new users. Container running with zero automatic restarts/OOM and no startup errors. Database backup retained in private runtime storage.
+
+Urgent correction: departed configured servers must not block global bans in active servers.
+- [x] Skip departed guilds during protected-target checks; retain checks in joined guilds.
+- [x] Verify, commit, push, restart, and confirm startup.
+
+Hotfix `4623ff2` pushed and deployed: 35 offline tests pass, including a departed server plus active moderator protection. Startup completed, 40 commands synced, Discord/Gemini connected.
