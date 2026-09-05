@@ -68,8 +68,7 @@ async def is_federated_moderator(bot: 'AntiScamBot', user_id_to_check: int, *, s
     async def check_guild(guild_id: int):
         guild = bot.get_guild(guild_id)
         if not guild:
-            if strict:
-                raise RuntimeError(f"Cannot verify moderator status in guild {guild_id}")
+            # A departed server is not an active member of the federation.
             return False
         
         try:

@@ -162,6 +162,15 @@ class FederationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Bot accounts", result.skipped)
             add.assert_not_awaited()
 
+    async def test_departed_guild_does_not_block_active_federation(self):
+        from utils.checks import federated_ban_block_reason
+        guild = NS(id=1, name="Active", fetch_member=AsyncMock(side_effect=http_error()))
+        bot = NS(config={"federated_guild_ids": [1, 2], "moderator_roles_per_guild": {"1": [9], "2": [10]}},
+                 get_guild=lambda gid: guild if gid == 1 else None)
+        self.assertIsNone(await federated_ban_block_reason(bot, member(), member(5)))
+        guild.fetch_member = AsyncMock(return_value=NS(roles=[NS(id=9)]))
+        self.assertIn("moderators", await federated_ban_block_reason(bot, member(), member(5)))
+
     async def test_failed_protected_target_lookup_cannot_authorize_ban(self):
         guild = NS(id=1, name="Test", fetch_member=AsyncMock(side_effect=http_error(403, 50013)))
         bot = NS(config={"federated_guild_ids": [1], "moderator_roles_per_guild": {"1": [9]}},
