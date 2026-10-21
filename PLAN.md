@@ -1,42 +1,24 @@
-# Six moderation reliability and efficiency fixes
+# Resilient GitHub ban sync
 
-Goal: implement the six agreed fixes without adding the four deferred features or deploying changes.
+Goal: handle an unavailable GitHub source without misleading reports or stopping scheduled imports.
 
-Acceptance criteria:
-- Alert buttons enforce the existing moderator policy and always act on the clicked alert's user, including restored views.
-- Intended global bans use one handler; callers distinguish applied, already banned, skipped, and failed guilds. Alert delivery failures do not turn successful bans into failures.
-- Gemini uses one async client, bounded concurrency and deadlines; alerts appear before inference and moderator actions cancel pending work.
-- Partner checks use shared bounded concurrency; inactive screening caches expire; normal cached keyword/config reads do no filesystem work.
-- Trusted URLs alone are excluded; accompanying text and untrusted URLs remain screened.
-- Historical onboarding reads chunks, persists progress, resumes/retries incomplete work, preserves local unbans, and marks completion only when all work is resolved.
-- Focused offline regression checks and configured Ruff checks pass; final diff contains only in-scope changes.
+Acceptance: unavailable/empty sources report failure, partial downloads report partial sync, notification failures do not stop future runs, requests have a 30-second total timeout, existing bans remain intact, and daily retries continue.
 
-Steps:
-- [x] Inspect current code, callers, guidance, and verification environment.
-- [x] Fix alert authorization/target recovery and federated action outcomes.
-- [x] Fix async AI lifecycle, screening concurrency/caches, and trusted URL handling.
-- [x] Implement checkpointed onboarding and exception preservation.
-- [x] Add and run focused offline regressions; apply safe relevant Ruff fixes and rerun checks.
-- [x] Resolve review findings: protected-target checks, onboarding/removal coordination, and original ban provenance.
-- [x] Add regression cases for all three findings; run offline checks and review the final diff.
+- [x] Trace source fetch, database writes, notification paths, and scheduler behavior.
+- [x] Implement bounded requests, accurate outcomes, and independent notification error handling.
+- [x] Add focused failure/recovery regressions; run checks and review diff.
+- [x] Restart existing bot and verify unavailable-source reporting and continued operation.
 
-Constraints: preserve runtime data and existing changes; no live moderation, deployment, external messages, or deferred feature work. Native `update_plan` is unavailable in this session.
+Constraints: preserve existing dirty changes/configuration and daily schedule; no source changes or ban removals. Native update_plan is unavailable.
 
-Prior implementation verification: 27 offline regressions passed in a network-disabled, read-only container using the production Python/dependency image. All four cogs load; shutdown cancels pending inference and closes its client. Safe relevant Ruff fixes, the non-mutating Ruff check, and final diff review pass. Runtime data and the running bot were not modified.
+Verification: all 37 tests pass in a network-disabled read-only container, including actual scheduled recovery after both notification channels fail. Full configured Ruff and diff checks pass. Source/account and runtime configuration unchanged.
 
-Operational note: onboarding creates its checkpoint tables at the next normal startup. Resume via `/onboard-server`; ambiguous interrupted actions are reported for review, and previously completed servers remain protected from replay. No deferred features were added.
+Deployment: bot restarted successfully, loaded all four cogs, synced 40 commands, connected to 10 guilds and initialized Gemini. Live GitHub 404 now reports source unavailable, existing bans retained, next attempt in 24 hours; no notification failures observed.
 
-Review corrections verified: protected targets are checked at command entry and federation execution; failed moderator lookups block the action. Onboarding revalidates the master record under a per-user lock shared with removals and local overrides. Existing ban evidence/provenance is preserved atomically, and master-alert reasons are extracted correctly. All 34 offline regressions pass in the isolated production image, including both removal/ban orderings. Ruff and final diff checks pass; no deployment or runtime data changes.
+Review and commit:
+- [x] Review importer, failure outcomes, scheduler recovery and test assertions for scope/correctness.
+- [x] Run final checks and commit only the sync fix, its regressions and this plan.
 
-Deployment authorized by user: commit and push the verified changes, restart the existing bind-mounted container without changing dependencies or mounts, and verify startup plus checkpoint schema.
+Review correction: reset report mocks between failure cases and assert exactly one report per channel, preventing a previous case from hiding a missing notification. Removed a stale comment and simplified a mock import. Earlier URL-whitelist support and test-pruning changes remain separate.
 
-- [x] Commit and push changes to main (`cf8cfe2`).
-- [x] Back up the database, redeploy, and verify runtime health.
-
-Deployment result (2026-09-05): source commit `cf8cfe2` pushed to main; existing bind-mounted container restarted. All four cogs loaded, 40 commands synced, Discord connected to 9 guilds, Gemini initialized, checkpoint schema verified, and initial external sync finished successfully with no new users. Container running with zero automatic restarts/OOM and no startup errors. Database backup retained in private runtime storage.
-
-Urgent correction: departed configured servers must not block global bans in active servers.
-- [x] Skip departed guilds during protected-target checks; retain checks in joined guilds.
-- [x] Verify, commit, push, restart, and confirm startup.
-
-Hotfix `4623ff2` pushed and deployed: 35 offline tests pass, including a departed server plus active moderator protection. Startup completed, 40 commands synced, Discord/Gemini connected.
+Final validation: 37 tests passed in the isolated production image; configured Ruff and diff checks passed. No behavior changes were needed during review.

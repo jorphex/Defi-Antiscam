@@ -22,6 +22,7 @@ REPO_OWNER = "imimim-username"  # The owner of the repository
 REPO_NAME = "scraped_bios"      # The name of the repository
 USER_ID_TO_PING = 369605002613751818
 CHANNEL_ID_TO_SEND = 1416358313708486748
+GITHUB_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 class BackgroundTasks(commands.Cog):
     def __init__(self, bot: 'AntiScamBot'):
@@ -46,9 +47,9 @@ class BackgroundTasks(commands.Cog):
             logger.error("BACKGROUND TASK: GITHUB_PAT not found. Sync cancelled.")
             return
 
-        summary_title = "External Ban List Sync Report"
-        summary_description = ""
-        summary_color = discord.Color.green()
+        summary_title = "External Ban List Sync Failed"
+        summary_description = "Sync did not complete. Existing bans retained; next attempt in 24 hours."
+        summary_color = discord.Color.red()
         new_users_added_count = 0
         total_profiles_scanned = 0
         bot_profiles_skipped = 0
@@ -60,12 +61,16 @@ class BackgroundTasks(commands.Cog):
         }
 
         try:
-            async with aiohttp.ClientSession(headers=headers) as session:
-                # Step 1: Get the list of files (Unchanged)
+            async with aiohttp.ClientSession(headers=headers, timeout=GITHUB_REQUEST_TIMEOUT) as session:
+                # Step 1: Get the list of files
                 api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
                 async with session.get(api_url) as response:
                     if response.status != 200:
                         logger.error(f"BACKGROUND TASK: Failed to list repo contents. Status: {response.status}")
+                        summary_description = (
+                            f"GitHub source unavailable (HTTP {response.status}). "
+                            "Existing bans retained; next attempt in 24 hours."
+                        )
                         return
                     files_data = await response.json()
                 
@@ -75,7 +80,10 @@ class BackgroundTasks(commands.Cog):
                     if fnmatch.fnmatch(file["name"], "master_part_*.jsonl")
                 ]
                 if not jsonl_files:
-                    logger.info("BACKGROUND TASK: No matching master_part_*.jsonl files found in the repository.")
+                    logger.warning("BACKGROUND TASK: No matching master_part_*.jsonl files found in the repository.")
+                    summary_description = (
+                        "No matching ban-list files found. Existing bans retained; next attempt in 24 hours."
+                    )
                     return
                 
                 logger.info(f"BACKGROUND TASK: Found {len(jsonl_files)} files to process: {jsonl_files}")
@@ -85,15 +93,24 @@ class BackgroundTasks(commands.Cog):
                 bot_owner_id = self.bot.config.get("bot_owner_id", 0)
                 whitelisted_user_ids = data_manager.get_whitelisted_user_ids(self.bot.config)
 
-                # Step 2: Fetch RAW content (Unchanged logic, just updated data structure)
+                failed_files = 0
+                downloaded_files = 0
+                # Continue importing available files when another download fails.
                 for file_path in jsonl_files:
                     raw_url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{file_path}"
                     
-                    async with session.get(raw_url) as response:
-                        if response.status != 200:
-                            logger.error(f"BACKGROUND TASK: Failed to fetch raw file content for '{file_path}'. Status: {response.status}")
-                            continue
-                        content_str = await response.text()
+                    try:
+                        async with session.get(raw_url) as response:
+                            if response.status != 200:
+                                logger.error(f"BACKGROUND TASK: Failed to fetch raw file content for '{file_path}'. Status: {response.status}")
+                                failed_files += 1
+                                continue
+                            content_str = await response.text()
+                    except (aiohttp.ClientError, TimeoutError) as exc:
+                        failed_files += 1
+                        logger.warning("BACKGROUND TASK: Failed to download %s: %s", file_path, type(exc).__name__)
+                        continue
+                    downloaded_files += 1
                     
                     for line in content_str.splitlines():
                         line = line.strip()
@@ -134,6 +151,13 @@ class BackgroundTasks(commands.Cog):
                         except json.JSONDecodeError:
                             logger.warning(f"BACKGROUND TASK: Skipping invalid JSON line in '{file_path}'.")
 
+                if not downloaded_files:
+                    summary_description = (
+                        f"All {failed_files} ban-list downloads failed. "
+                        "Existing bans retained; next attempt in 24 hours."
+                    )
+                    return
+
                 # Step 3: Bulk Import to DB
                 # Get current count before import
                 existing_ban_count = await data_manager.db_get_ban_count()
@@ -152,6 +176,17 @@ class BackgroundTasks(commands.Cog):
                     f"**New Users Added:** `{new_users_added_count}`"
                 )
 
+                summary_title = "External Ban List Sync Report"
+                summary_color = discord.Color.green()
+                if failed_files:
+                    summary_title = "External Ban List Sync Partial"
+                    summary_color = discord.Color.orange()
+                    summary_description += (
+                        f"\n**Files Downloaded:** `{downloaded_files}/{len(jsonl_files)}`"
+                        f"\n**Failed Downloads:** `{failed_files}`"
+                        "\nExisting bans retained; failed downloads will be retried in 24 hours."
+                    )
+
                 if new_users_added_count > 0:
                     logger.info(f"✅ Merge complete! Database updated with {new_users_added_count} new entries.")
                 else:
@@ -160,40 +195,36 @@ class BackgroundTasks(commands.Cog):
         except Exception as e:
             logger.error(f"BACKGROUND TASK: An unexpected error occurred during sync: {e}", exc_info=True)
             summary_title = "Sync Failed: Unexpected Error"
-            summary_description = f"An error occurred during the sync process.\n\n`{e}`"
+            summary_description = (
+                f"Sync interrupted ({type(e).__name__}). Existing bans retained; next attempt in 24 hours."
+            )
             summary_color = discord.Color.red()
         
         finally:
-            log_channel_id = self.bot.config.get("log_channel_id")
-            if log_channel_id and (log_channel := self.bot.get_channel(log_channel_id)):
-                embed = discord.Embed(
-                    title=f"🔄 {summary_title}",
-                    description=summary_description,
-                    color=summary_color,
-                    timestamp=datetime.now(timezone.utc)
-                )
-                if new_users_added_count > 0:
-                    embed.add_field(name="New Total Bans", value=f"`{current_db_count}`")
-                
-                await log_channel.send(embed=embed)
+            logger.info("BACKGROUND TASK: %s: %s", summary_title, summary_description.replace("\n", "; "))
+            try:
+                log_channel_id = self.bot.config.get("log_channel_id")
+                if log_channel_id and (log_channel := self.bot.get_channel(log_channel_id)):
+                    embed = discord.Embed(
+                        title=f"🔄 {summary_title}",
+                        description=summary_description,
+                        color=summary_color,
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    if new_users_added_count > 0:
+                        embed.add_field(name="New Total Bans", value=f"`{current_db_count}`")
+                    await log_channel.send(embed=embed)
+            except Exception:
+                logger.exception("BACKGROUND TASK: Failed to send sync report; scheduled sync remains enabled.")
 
             try:
                 channel = self.bot.get_channel(CHANNEL_ID_TO_SEND) or await self.bot.fetch_channel(CHANNEL_ID_TO_SEND)
                 if channel:
                     timestamp = f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>"
-                    if new_users_added_count > 0:
-                        message = (
-                            f"<@{USER_ID_TO_PING}>, the external ban list sync is complete. "
-                            f"**{new_users_added_count}** new user(s) were added to the master database {timestamp}."
-                        )
-                    else:
-                        message = (
-                            f"ℹ️ The external ban list sync just completed {timestamp}. "
-                            "No new users were found to add to the master database."
-                        )
-                    await channel.send(message)
-            except Exception as e:
-                logger.error(f"Failed to send sync notification to user: {e}")
+                    mention = f"<@{USER_ID_TO_PING}> " if new_users_added_count > 0 else ""
+                    await channel.send(f"{mention}**{summary_title}** {timestamp}\n{summary_description}")
+            except Exception:
+                logger.exception("BACKGROUND TASK: Failed to send sync notification; scheduled sync remains enabled.")
 
     @sync_external_bans.before_loop
     async def before_sync(self):
