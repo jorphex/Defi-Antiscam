@@ -98,15 +98,6 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("failed: 1", next(f.value for f in update["embed"].fields if f.name == "Status"))
         self.assertTrue(update["view"].ban_button.disabled)
 
-    async def test_whitelisted_skip_does_not_show_success(self):
-        event = interaction()
-        with patch("ui.views.process_federated_ban", new_callable=AsyncMock,
-                   return_value=BanResult(skipped="User is on the global whitelist.")):
-            await ScreeningView().ban_button.callback(event)
-        update = event.followup.edit_message.await_args.kwargs
-        self.assertFalse(update["view"].ban_button.disabled)
-        self.assertIn("Skipped", next(f.value for f in update["embed"].fields if f.name == "Status"))
-
 
 class FederationTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_outcomes_and_notification_failure(self):
@@ -154,8 +145,6 @@ class FederationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(dm, "db_add_ban", new_callable=AsyncMock) as add:
             owner = await process_federated_ban(bot, guild, member(111), member(5), "test", {})
             self.assertIn("owner", owner.skipped)
-            protected = await process_federated_ban(bot, guild, member(222), member(5), "test", {})
-            self.assertIn("moderators", protected.skipped)
             bot_account = member(333)
             bot_account.bot = True
             result = await process_federated_ban(bot, guild, bot_account, member(5), "test", {})
@@ -188,8 +177,11 @@ class FederationTests(unittest.IsolatedAsyncioTestCase):
             await ScreeningView().ban_button.callback(event)
         add.assert_not_awaited()
         event.guild.ban.assert_not_awaited()
-        embed = event.followup.edit_message.await_args.kwargs["embed"]
-        self.assertIn("moderators", next(field.value for field in embed.fields if field.name == "Status"))
+        update = event.followup.edit_message.await_args.kwargs
+        status = next(field.value for field in update["embed"].fields if field.name == "Status")
+        self.assertIn("moderators", status)
+        self.assertIn("Skipped", status)
+        self.assertFalse(update["view"].ban_button.disabled)
 
 
 class AiTests(unittest.IsolatedAsyncioTestCase):
@@ -297,7 +289,6 @@ class ScreeningTests(unittest.IsolatedAsyncioTestCase):
                      "malicious https://linktr.ee/quantusnetwork", "https://quantus.com https://evil.example"):
             with self.subTest(text=text):
                 self.assertTrue(screening.check_text_for_keywords(text, rules))
-
 
     def test_cache_cleanup_keeps_recent_activity(self):
         now = datetime.now(timezone.utc)
@@ -437,11 +428,6 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await run_onboarding(self.bot, self.guild, AsyncMock())
         self.guild.ban.assert_not_awaited()
 
-    async def test_existing_database_migration_preserves_bans(self):
-        await self.add_bans(111)
-        await dm.init_db()
-        self.assertEqual((await dm.db_get_ban(111))["username"], "user111")
-
     async def test_legacy_completed_server_cannot_be_replayed(self):
         from cogs.mod_commands import ModCommands
         await dm.mark_onboarding_complete(1)
@@ -455,6 +441,13 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         await dm.db_add_ban(111, "original name", "Original scam evidence", 2, "Original guild", 77,
                             "2025-01-01", bio="Imported bio evidence")
         original = await dm.db_get_ban(111)
+        self.assertEqual(
+            (original["reason"], original["origin_guild_id"], original["moderator_id"], original["bio_at_import"]),
+            ("Original scam evidence", 2, 77, "Imported bio evidence"),
+        )
+        # Restart-time initialization must preserve the evidence before an alert reuses it.
+        await dm.init_db()
+        self.assertEqual(await dm.db_get_ban(111), original)
         event = interaction()
         event.message.embeds[0].title = "Flagged User (Master Ban List)"
         event.message.embeds[0].clear_fields()
@@ -470,12 +463,6 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await dm.db_get_ban(111), original)
         self.assertIn("Original scam evidence", event.guild.ban.await_args.kwargs["reason"])
         self.assertNotIn("Reason not parsed", event.guild.ban.await_args.kwargs["reason"])
-
-    async def test_new_ban_still_records_provenance(self):
-        await dm.db_add_ban(111, "name", "evidence", 2, "origin", 77, "2026-01-01", "bio")
-        record = await dm.db_get_ban(111)
-        self.assertEqual((record["reason"], record["origin_guild_id"], record["moderator_id"], record["bio_at_import"]),
-                         ("evidence", 2, 77, "bio"))
 
     async def test_removal_during_onboarding_lookup_prevents_ban(self):
         await self.add_bans(111)
