@@ -41,9 +41,16 @@ The bot needs these permissions in any member server to function correctly:
 - `Read Message History` (for context and moderation flows)
 - `Manage Messages` (to delete scam messages)
 - `Moderate Members` (to timeout flagged users)
-- `Ban Members` and `Unban Members`
+- `Ban Members` (covers both banning and unbanning)
 - `Kick Members` (used by moderator tools)
 - `View Audit Log` (to detect manual bans/unbans for federation)
+
+Optional permissions:
+
+- `Manage Roles` if automatic safe-role assignment is enabled. Place the safe role below the bot's highest role.
+- `Send Messages in Threads` if the bot needs to post alerts or replies inside threads.
+
+Place the bot's role above members it needs to kick, ban, or timeout. Ensure channel overrides allow it to view monitored channels and send messages and embeds in both the action-alert and federation-notification channels. `Administrator` is not required.
 
 ### Current Federated Servers
 - Yearn
