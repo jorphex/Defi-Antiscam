@@ -283,6 +283,22 @@ class ScreeningTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(screening.check_text_for_keywords(text, rules))
         self.assertIn("malicious", screening.check_text_for_keywords("[malicious](https://trusted.example/path)", rules))
 
+    def test_domain_and_specific_path_exemptions(self):
+        rules = {"simple_keywords": ["malicious"], "regex_patterns": [r"https?://"],
+                 "whitelisted_domains_regex": [r"(?:[a-z0-9-]+\.)*quantus\.com", r"linktr\.ee/quantusnetwork/?"]}
+        for text in ("https://quantus.com", "https://docs.quantus.com/start", "https://a.b.quantus.com/path?q=1",
+                     "https://linktr.ee/quantusnetwork", "https://linktr.ee/quantusnetwork/?utm_source=discord",
+                     "linktr.ee/quantusnetwork", "https://www.linktr.ee/quantusnetwork#links"):
+            with self.subTest(text=text):
+                self.assertEqual(screening.check_text_for_keywords(text, rules), [])
+        for text in ("https://quantus.com.evil.example", "https://fakequantus.com", "https://quantus.com@evil.example",
+                     "https://linktr.ee/other", "https://linktr.ee/quantusnetworkfake", "https://linktr.ee/quantusnetwork/other",
+                     "https://evil.example/linktr.ee/quantusnetwork", "https://linktr.ee/other?next=/quantusnetwork",
+                     "malicious https://linktr.ee/quantusnetwork", "https://quantus.com https://evil.example"):
+            with self.subTest(text=text):
+                self.assertTrue(screening.check_text_for_keywords(text, rules))
+
+
     def test_cache_cleanup_keeps_recent_activity(self):
         now = datetime.now(timezone.utc)
         old = now - timedelta(minutes=10)

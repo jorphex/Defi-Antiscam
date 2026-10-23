@@ -498,7 +498,8 @@ def exclude_trusted_urls(text: str, domain_patterns: list[str]) -> str:
             host = parsed.hostname.lower().removeprefix("www.")
             for pattern in domain_patterns:
                 try:
-                    if re.fullmatch(pattern, host, re.IGNORECASE):
+                    candidate = host + parsed.path if "/" in pattern else host
+                    if re.fullmatch(pattern, candidate, re.IGNORECASE):
                         return " " + token[len(url):]
                 except re.error:
                     logger.warning("Invalid trusted-domain regex: %s", pattern)
